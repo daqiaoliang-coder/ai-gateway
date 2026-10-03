@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-gateway-config
+data:
+  gateway.json: |
+    {
+      "listen_addr": ":8080",
+      "request_timeout": "120s",
+      "max_request_bytes": 2097152,
+      "max_concurrent_requests": 128,
+      "retry_max_attempts": 2,
+      "breaker_failures": 5,
+      "breaker_open_seconds": 30,
+      "metrics_token_env": "AI_GATEWAY_METRICS_TOKEN",
+      "clients": [
+        {"id":"demo-app","key_env":"AI_GATEWAY_CLIENT_KEY","allowed_models":["fast"],"rpm":60}
+      ],
+      "providers": [
+        {"name":"openai-primary","base_url":"https://api.openai.com/v1","model":"gpt-4.1-mini","api_key_env":"OPENAI_API_KEY"}
+      ],
+      "models": [
+        {"name":"fast","deployments":["openai-primary"]}
+      ]
+    }
