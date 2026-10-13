@@ -22,12 +22,21 @@ flowchart LR
 
 - `POST /v1/chat/completions`：OpenAI Chat Completions 请求格式，支持非流式和 SSE 流式响应。
 - `GET /v1/models`：按客户端权限返回可用模型别名。
-- `GET /healthz` 和 `GET /readyz`：容器探针。
+- `GET /healthz` 和 `GET /readyz`：容器探针。`/readyz` 在实例开始排空后返回 503，因此关停中的副本不再接收新流量。
+- `GET /upstreams`：各供应商的熔断与最近联系状态，仅供观测，与 `/metrics` 共用 token。**`/healthz` 不依赖上游**，上游故障不会导致全量重启。
 - `GET /metrics`：可选 Bearer 保护的 Prometheus 文本指标；不配置 token 时返回 404。
 - 多客户端密钥、模型白名单、客户端 RPM 和全局并发上限。
-- 模型别名映射到多个 OpenAI 兼容部署，按轮询起点分配；上游连接错误、429 和 5xx 可有限切换。
+- 模型别名映射到多个 OpenAI 兼容部署，按轮询起点分配；是否重试由[行为约定](docs/behavior-contract.md)判定，不由状态码列表判定。
 - 熔断器、请求体上限、上游超时、优雅关停、请求 ID 和结构化日志。
 - API 密钥只从环境变量读取；日志不包含提示词或响应正文。
+
+### 请求正确性与故障处理
+
+- **一个总时限**：`timeouts.total_deadline` 覆盖全部重试，每次尝试不再重新计时；剩余时限不足时不再发起新尝试。
+- **按结果分类重试**：用 `httptrace` 判断请求字节是否真的发出。建连前失败可以换供应商；429/408 可以换供应商；5xx、已发出后的传输失败、响应已开始转发——**默认一律不重放**，避免重复生成与重复扣费。
+- **流式不切换**：响应体一旦开始写给客户端，就不再换上游；中途断流按 `aborted_client / aborted_upstream / aborted_gateway / truncated` 记录，**不计为成功**。
+- **有上限的 SSE**：单条事件和整个流都有硬上限，边读边判，超大事件不会被完整缓冲。
+- 退避指数增长并带抖动，遵守上游 `Retry-After` 且不超过 `max_retry_after`；等待计入总时限。
 
 ## 快速开始
 
@@ -63,18 +72,40 @@ curl http://localhost:8080/v1/chat/completions \
 - `providers`：OpenAI 兼容服务的基础 URL、上游模型名和 API 密钥环境变量。
 - `models`：客户端可见的别名及部署顺序。
 
-非 429 的上游 4xx 会直接返回给客户端，避免因输入错误静默切换模型。上游 429 和 5xx、网络错误可以切换到下一部署，单个请求最多尝试 `retry_max_attempts` 个部署。
+非 429 的上游 4xx 会直接返回给客户端，避免因输入错误静默切换模型。其余情况按[行为约定](docs/behavior-contract.md)的结果分类处理，不再由 `retry_max_attempts` 和状态码列表单独决定；`retry_max_attempts` 只作为尝试次数的上限保留。
+
+行为约定默认从内置值加载，可用 `-policy` 指定文件：
+
+```sh
+go run ./cmd/gateway -config configs/gateway.json -policy configs/policy.example.json
+```
+
+## 行为约定
+
+网关面对重试、回退、限流、预算、超时、流式中断和排空的行为以 [docs/behavior-contract.md](docs/behavior-contract.md) 为准。它的机器可检版本在 `internal/policy`：
+
+- `Contract` 结构体 + `Validate()`：配置与交叉字段约束，示例见 `configs/policy.example.json`。
+- `Classify()` / `Decide()`：把一次失败的尝试映射成允许的动作。**默认配置下，上游结果不确定的请求一律不重放。**
+- `StreamCompletion.CountsAsSuccess()`：只有 `completed` 允许记为成功。
+
+回归断言见 `internal/policy/policy_test.go`；后续阶段不得使其失败。
+
+```sh
+go test -race ./...
+```
 
 ## 生产部署边界
 
 这个版本适合先以单实例、受控流量部署并验证兼容性。扩大流量前应完成以下工作：
 
-1. 把客户端 RPM 限流替换成 Redis 等共享原子限流器，并增加 TPM / 预算预留与实际用量核对。目前的 RPM 桶和熔断器是进程内状态，多副本之间不共享。
+1. 把客户端 RPM 限流替换成 Redis 等共享原子限流器，并增加 TPM / 预算预留与实际用量核对。目前的 RPM 桶和熔断器是进程内状态，多副本之间不共享。具体规则见 [行为约定](docs/behavior-contract.md)。
 2. 将静态 JSON 配置迁移到受 RBAC 保护的控制面或受版本管理的配置发布流程；密钥放入 Secret Manager / Kubernetes Secret。
 3. 配置 Prometheus 抓取、告警、日志保留和区域出口策略。`/metrics` 应只在内网暴露，并配置独立 token。
 4. 根据供应商能力建立适配器矩阵。当前只支持 OpenAI Chat Completions 兼容协议；不支持 Anthropic 原生 Messages、Responses API、工具协议适配、音视频或语义缓存。
 5. 为回退策略指定语义兼容的模型，确认区域、数据分类、输出质量和费用约束；上游价格未配置，因此此版本不计算账单金额。
 6. 根据业务设定 SLO，并在发布前验证负载、断连、429、超时、上游故障和进程关停场景。
+
+排空相关的三个时长必须对齐：Deployment 的 `terminationGracePeriodSeconds`（45s）、`preStop` 等待（5s）和行为约定的 `drain.timeout`（30s）。`/healthz` 恒为 200，不要改成依赖上游。
 
 默认服务不提供 TLS 终止，生产环境应部署在受控的反向代理或负载均衡器之后。网络出口应限制为配置中的上游主机；配置文件属于管理员信任边界。
 

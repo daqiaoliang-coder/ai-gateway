@@ -69,13 +69,57 @@ paths:
         '400': { $ref: '#/components/responses/GatewayError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/GatewayError' }
+        '408': { $ref: '#/components/responses/GatewayError' }
         '413': { $ref: '#/components/responses/GatewayError' }
         '429': { $ref: '#/components/responses/GatewayError' }
         '502': { $ref: '#/components/responses/GatewayError' }
         '503': { $ref: '#/components/responses/GatewayError' }
+      headers:
+        X-Request-ID:
+          description: Gateway request identifier, echoed by upstream calls.
+          schema: { type: string }
+  /readyz:
+    get:
+      summary: Readiness probe
+      description: Returns 503 once the instance starts draining, so it stops receiving new traffic.
+      responses:
+        '200':
+          description: Ready to accept traffic
+          content:
+            text/plain:
+              schema: { type: string }
+        '503': { $ref: '#/components/responses/GatewayError' }
+  /upstreams:
+    get:
+      summary: Provider health for observation
+      description: >
+        Circuit and last contact state per provider. Requires the metrics bearer
+        token. Liveness never depends on this, so a provider outage cannot restart
+        the fleet.
+      security:
+        - metricsAuth: []
+      responses:
+        '200':
+          description: Provider status list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { const: list }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/UpstreamStatus' }
+                required: [object, data]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Not exposed because no metrics token is configured
 components:
   securitySchemes:
     bearerAuth:
+      type: http
+      scheme: bearer
+    metricsAuth:
       type: http
       scheme: bearer
   responses:
@@ -92,12 +136,50 @@ components:
   schemas:
     ErrorEnvelope:
       type: object
+      description: >
+        Every gateway error uses this envelope. code is drawn from a closed set
+        defined by the behavior contract; provider errors are normalized into it
+        unless their status is explicitly allowed to pass through.
       properties:
         error:
           type: object
           properties:
             message: { type: string }
             type: { type: string }
-            code: { type: string }
+            code:
+              type: string
+              enum:
+                - unauthorized
+                - model_not_allowed
+                - model_not_found
+                - invalid_request
+                - request_too_large
+                - rate_limit_exceeded
+                - budget_exceeded
+                - gateway_overloaded
+                - upstream_unavailable
+                - upstream_rate_limited
+                - upstream_timeout
+                - upstream_error
+                - stream_aborted
+                - draining
+                - not_found
+                - internal_error
+            provider:
+              type: string
+              description: Provider that produced the failure, when the error came from upstream.
+            provider_status:
+              type: integer
+              description: Raw upstream status code, when the error came from upstream.
           required: [message, type, code]
       required: [error]
+    UpstreamStatus:
+      type: object
+      properties:
+        name: { type: string }
+        model: { type: string }
+        circuit_open: { type: boolean }
+        consecutive_failures: { type: integer }
+        last_success: { type: string, format: date-time }
+        last_failure: { type: string, format: date-time }
+      required: [name, model, circuit_open, consecutive_failures]

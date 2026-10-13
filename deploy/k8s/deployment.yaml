@@ -4,6 +4,14 @@ metadata:
   name: ai-gateway
 spec:
   replicas: 1
+  # Must exceed the contract drain.timeout so in-flight requests can finish.
+  # Keep it aligned with terminationGracePeriodSeconds and the drain timeout.
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: ai-gateway
@@ -12,10 +20,21 @@ spec:
       labels:
         app: ai-gateway
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
         - name: ai-gateway
           image: ghcr.io/daqiaoliang-coder/ai-gateway:latest
-          args: ["-config", "/app/configs/gateway.json"]
+          args:
+            - "-config"
+            - "/app/configs/gateway.json"
+            - "-policy"
+            - "/app/configs/policy.json"
+          lifecycle:
+            preStop:
+              exec:
+                # Gives kubelet time to remove this pod from the Service
+                # endpoints before the gateway starts refusing traffic.
+                command: ["/bin/sh", "-c", "sleep 5"]
           ports:
             - name: http
               containerPort: 8080

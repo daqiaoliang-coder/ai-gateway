@@ -13,10 +13,12 @@ import (
 
 	"github.com/daqiaoliang-coder/ai-gateway/internal/config"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/gateway"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/policy"
 )
 
 func main() {
 	configPath := flag.String("config", "configs/gateway.json", "path to gateway JSON config")
+	policyPath := flag.String("policy", "", "path to the behavior contract JSON; defaults to the built-in contract")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -25,7 +27,20 @@ func main() {
 		logger.Error("configuration error", "error", err)
 		os.Exit(2)
 	}
-	service, err := gateway.New(cfg, logger)
+	contract := policy.Default()
+	if *policyPath != "" {
+		loaded, err := policy.Load(*policyPath)
+		if err != nil {
+			logger.Error("behavior contract error", "error", err)
+			os.Exit(2)
+		}
+		contract = loaded
+	} else {
+		logger.Info("no behavior contract supplied, using built-in defaults",
+			"total_deadline", contract.Timeouts.TotalDeadline,
+			"max_attempts", contract.Retry.MaxAttempts)
+	}
+	service, err := gateway.New(cfg, contract, logger)
 	if err != nil {
 		logger.Error("gateway initialization error", "error", err)
 		os.Exit(2)
@@ -47,15 +62,23 @@ func main() {
 		serveErr <- server.ListenAndServe()
 	}()
 
+	drainTimeout, err := time.ParseDuration(contract.Drain.Timeout)
+	if err != nil {
+		logger.Error("invalid drain timeout", "error", err)
+		os.Exit(2)
+	}
+
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-signals:
-		logger.Info("shutdown requested", "signal", sig.String())
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// Stop accepting new traffic first, then let in-flight requests finish.
+		service.Drain()
+		logger.Info("shutdown requested, draining", "signal", sig.String(), "drain_timeout", drainTimeout.String())
+		ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
-			logger.Error("graceful shutdown failed", "error", err)
+			logger.Error("graceful shutdown did not finish in time", "error", err)
 			_ = server.Close()
 			os.Exit(1)
 		}

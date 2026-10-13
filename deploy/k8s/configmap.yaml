@@ -23,3 +23,33 @@ data:
         {"name":"fast","deployments":["openai-primary"]}
       ]
     }
+  policy.json: |
+    {
+      "version": 1,
+      "entrance": {"timeout": "60s", "safety_margin": "5s"},
+      "timeouts": {"total_deadline": "45s", "attempt_timeout": "20s", "upstream_connect_timeout": "5s"},
+      "retry": {
+        "max_attempts": 3,
+        "retry_on_unknown_outcome": false,
+        "backoff_initial": "200ms",
+        "backoff_max": "2s",
+        "backoff_multiplier": 2,
+        "jitter": true,
+        "respect_retry_after": true,
+        "max_retry_after": "10s"
+      },
+      "fallback": {"require_compatibility_group": true, "allow_cross_provider_on_unknown_outcome": false, "allow_alias_name_as_compatibility": false},
+      "quota": {
+        "tenant_key": "client_id",
+        "budget_window": "calendar_month",
+        "currency": "USD",
+        "store": {"mode": "shared", "on_unavailable": "degrade", "degrade_factor": 0.5, "reservation_ttl": "10m"},
+        "stream_reserve_tokens": 4096,
+        "stream_overage": "abort"
+      },
+      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both"},
+      "streaming": {"max_event_bytes": 262144, "max_stream_bytes": 16777216, "require_usage_in_stream": true, "abort_on_client_gone": true},
+      "drain": {"timeout": "30s", "readiness_fails_on_drain": true, "liveness_depends_on_upstream": false},
+      "observability": {"max_label_cardinality": 200, "allowed_labels": ["tenant", "client", "model", "provider", "route", "status_class", "outcome", "error_code"]},
+      "error_codes": {"passthrough_statuses": []}
+    }
