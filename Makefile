@@ -1,4 +1,4 @@
-.PHONY: build run fmt
+.PHONY: build run fmt vet test
 
 build:
 	mkdir -p bin
@@ -9,3 +9,9 @@ run:
 
 fmt:
 	gofmt -w $$(find cmd internal -name '*.go')
+
+vet:
+	go vet ./...
+
+test:
+	go test -race ./...
