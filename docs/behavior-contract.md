@@ -89,7 +89,15 @@
 
 - 请求**前**预留（reserve），响应完成**后**核账（settle）。
 - 预留和核账以 `request_id` + 尝试序号作为幂等键，重试不会重复扣账。
-- 预留带 TTL（`reservation_ttl`，默认 10m，上限 24h），进程崩溃后由清扫器回收，避免额度泄漏。
+- 预留带 TTL（`reservation_ttl`，默认 10m，上限 24h），进程崩溃后由清扫器回收，避免额度泄漏。清扫器每 `sweep_interval`（默认 1m，上限 1h）运行一次，扫描本副本见过的窗口键。
+
+**窗口是固定分桶，不是滑动窗口。** 分桶边界处一个租户在相邻两个窗口内各花满一次是可能的（最坏 2 倍）。滑动窗口需要保留窗口内每一笔消费再做区间求和，在月度规模下不可行。若业务不能接受边界突发，应把预算窗口缩短并留出余量。
+
+已实现：`internal/quota`
+- `MemoryStore`：进程内实现，语义完整（幂等、过期回收、并发安全），用于 `mode: local` 与降级兜底。
+- `RedisStore`：跨副本共享。全部判定逻辑放在 Lua 脚本里执行（`GET/INCRBY/DECRBY/ZADD/ZREM/ZRANGEBYSCORE/HSET`），保证「检查 + 占位」是原子的——两个副本不会同时抢到最后一份额度。客户端是自带的极简 RESP 实现，项目不引入第三方依赖。
+- 每个窗口键有三个卫星键：`:u` 已核账、`:h` 在途预留、`:p` 未结算预留的 ZSET（score 为过期时间，用于崩溃回收）。
+- 金额一律用 `int64` 微单位（1e-6 货币单位）累计，避免浮点漂移。
 
 共享存储不可用时的降级（`quota.store.on_unavailable`）：
 
@@ -176,13 +184,14 @@ SSE 响应的完成状态 `StreamCompletion`：
 
 | # | 位置 | 剩余差距 | 阶段 |
 | --- | --- | --- | --- |
-| 1 | 限流 | 进程内令牌桶，无 TPM/预算/跨副本共享 | 2 |
-| 2 | 用量 | 无持久化用量审计事件，流式 token 依赖上游上报 | 2 |
-| 3 | 身份 | 无密钥轮换/撤销窗口，无租户抽象，密钥只在启动时读取 | 2/3 |
-| 4 | 出口 | 上游仍可用明文 HTTP，无部署侧出口限制 | 3 |
-| 5 | `deployment.yaml` | `replicas: 1`、`image: latest`，无 PDB / NetworkPolicy | 4 |
-| 6 | `metrics.go` | 无直方图桶、无标签，无法按租户/模型/供应商切分 | 4 |
-| 7 | CI | 无预发环境故障场景验证 | 4 |
+| 1 | 用量 | 审计事件已可查（stdout / 追加写文件），但尚未接入可聚合查询的存储；流式 token 仍依赖上游上报 | 4 |
+| 2 | 身份 | 无密钥轮换/撤销窗口，租户等于 `client_id`，密钥只在启动时读取 | 3 |
+| 3 | 出口 | 上游仍可用明文 HTTP，无部署侧出口限制 | 3 |
+| 4 | 部署 | `replicas: 1`、`image: latest`，无 PDB / NetworkPolicy / Redis 实例 | 4 |
+| 5 | `metrics.go` | 无直方图桶、无标签，无法按租户/模型/供应商切分 | 4 |
+| 6 | CI | 无预发环境故障场景验证；Redis 集成测试需显式开启 | 4 |
+
+补充：跨供应商回退目前只按 `models[].deployments` 的声明顺序尝试，兼容组尚未进入配置文件；`fallback.require_compatibility_group` 已生效于契约层，配置结构在后续阶段落地。平台级供应商预算是**事后核账**（请求前不知道哪个供应商会应答），超额在下一请求被拒绝并记录事件。
 
 补充：跨供应商回退目前只按 `models[].deployments` 的声明顺序尝试，兼容组尚未进入配置文件；`fallback.require_compatibility_group` 已生效于契约层，配置结构在阶段 2 落地。
 
@@ -200,6 +209,18 @@ SSE 响应的完成状态 `StreamCompletion`：
 6. `TestIncompleteNonStreamResponseIsNotRetried`：上游 200 但响应体不完整时不重试，返回 502。
 7. `TestClientSideFailureDoesNotOpenCircuit`：客户端断连与网关超时不触发熔断。
 8. `TestDrainingStopsNewTraffic` / `TestReadinessFailsWhileDrainingButLivenessDoesNot`：排空后拒绝新请求，`/readyz` 转 503，`/healthz` 恒 200。
+
+共享限额与成本核算（`go test -race ./internal/quota/ ./internal/cost/ ./internal/gateway/`）：
+
+9. `TestConcurrentReserveNeverOversells` / `TestRedisNeverOversellsUnderConcurrency`：并发预留绝不超卖（Redis 版本跑真实 Redis 与 Lua）。
+10. `TestReserveIsIdempotentPerAttemptID` / `TestSettleIsIdempotent`：重试不会重复占用，重复核账不会重复扣款。
+11. `TestExpiredHoldsAreReclaimed` / `TestRedisSweepReclaimsExpiredHolds`：预留过期后归还额度。
+12. `TestReplicasShareOneTenantBudget`：两个副本共用一个租户预算，第二个副本被拒。
+13. `TestBudgetExhaustionBlocksTheNextRequest` / `TestRequestRateLimitIsSeparateFromBudget`：金额与速率是两个维度，各自返回自己的错误码。
+14. `TestUsageEventIsTraceableByTenantModelAndProvider`：完成请求可按租户、模型、供应商追溯用量与费用。
+15. `TestUncertainFailureIsChargedOnce`：不确定结果的失败只预留一次、只核账一次。
+
+Redis 集成测试默认跳过，设置 `AI_GATEWAY_REDIS_TEST_ADDR`（例如 `127.0.0.1:6399`）后运行。
 
 契约层（`go test ./internal/policy/`）：
 

@@ -19,8 +19,17 @@ func TestDefaultContractIsValid(t *testing.T) {
 	if c.ReplaysUnknownOutcome() {
 		t.Fatal("default contract must not replay requests with unknown outcome")
 	}
-	if !c.HasDurableAuditSink() {
-		t.Fatal("default contract must emit usage events to a durable sink")
+	if c.HasDurableAuditSink() {
+		t.Fatal("default contract must not claim durability without a configured path")
+	}
+	if !c.Usage.EmitAuditEvents {
+		t.Fatal("default contract must still emit usage events")
+	}
+	if c.Quota.Store.Mode != "shared" {
+		t.Fatal("multi-replica sharing must be the default store mode")
+	}
+	if c.Quota.Store.OnUnavailable != "degrade" {
+		t.Fatal("losing the shared store should degrade, not fail open or closed")
 	}
 	if !c.Streaming.RequireUsageInStream {
 		t.Fatal("default contract must require usage reporting on streams")
@@ -347,7 +356,7 @@ func TestLoadFromFile(t *testing.T) {
       "quota": {"tenant_key": "client_id", "budget_window": "calendar_month", "currency": "USD",
                 "store": {"mode": "shared", "on_unavailable": "degrade", "degrade_factor": 0.5, "reservation_ttl": "10m"},
                 "stream_reserve_tokens": 4096, "stream_overage": "abort"},
-      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both"},
+      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both", "audit_file_path": "/tmp/ai-gateway-audit.jsonl"},
       "streaming": {"max_event_bytes": 262144, "max_stream_bytes": 16777216, "require_usage_in_stream": true, "abort_on_client_gone": true},
       "drain": {"timeout": "30s", "readiness_fails_on_drain": true, "liveness_depends_on_upstream": false},
       "observability": {"max_label_cardinality": 200, "allowed_labels": ["tenant", "model", "provider"]},

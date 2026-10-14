@@ -32,7 +32,18 @@
       "mode": "shared",
       "on_unavailable": "degrade",
       "degrade_factor": 0.5,
-      "reservation_ttl": "10m"
+      "reservation_ttl": "10m",
+      "sweep_interval": "1m",
+      "redis": {
+        "addr": "127.0.0.1:6379",
+        "password_env": "AI_GATEWAY_REDIS_PASSWORD",
+        "db": 0,
+        "pool_size": 8,
+        "dial_timeout": "2s",
+        "read_timeout": "2s",
+        "write_timeout": "2s",
+        "key_prefix": "ai-gateway"
+      }
     },
     "stream_reserve_tokens": 4096,
     "stream_overage": "abort"
@@ -41,7 +52,8 @@
     "missing_usage_policy": "estimate",
     "price_version_required": true,
     "emit_audit_events": true,
-    "audit_sink": "both"
+    "audit_sink": "both",
+    "audit_file_path": "/var/log/ai-gateway/audit.jsonl"
   },
   "streaming": {
     "max_event_bytes": 262144,

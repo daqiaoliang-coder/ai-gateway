@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/daqiaoliang-coder/ai-gateway/internal/cost"
 )
 
 type File struct {
@@ -22,6 +24,8 @@ type File struct {
 	Clients               []Client   `json:"clients"`
 	Providers             []Provider `json:"providers"`
 	Models                []Model    `json:"models"`
+	// Prices is the versioned price table used to turn tokens into money.
+	Prices []cost.Price `json:"prices"`
 }
 
 type Client struct {
@@ -29,6 +33,12 @@ type Client struct {
 	KeyEnv        string   `json:"key_env"`
 	AllowedModels []string `json:"allowed_models"`
 	RPM           int      `json:"rpm"`
+	// TPM caps tokens per minute for this tenant, separate from RPM.
+	TPM int64 `json:"tpm"`
+	// BudgetMicros caps tenant spend per budget window, in micro currency units.
+	BudgetMicros int64 `json:"budget_micros"`
+	// BudgetWindow overrides the contract-wide window for this tenant.
+	BudgetWindow string `json:"budget_window,omitempty"`
 }
 
 type Provider struct {
@@ -36,6 +46,8 @@ type Provider struct {
 	BaseURL   string `json:"base_url"`
 	Model     string `json:"model"`
 	APIKeyEnv string `json:"api_key_env,omitempty"`
+	// BudgetMicros caps platform-wide spend for this provider per window.
+	BudgetMicros int64 `json:"budget_micros"`
 }
 
 type Model struct {
@@ -117,10 +129,21 @@ func (c File) Validate() error {
 				return fmt.Errorf("provider %q requires non-empty environment variable %s", p.Name, p.APIKeyEnv)
 			}
 		}
+		if p.BudgetMicros < 0 {
+			return fmt.Errorf("provider %q budget_micros cannot be negative", p.Name)
+		}
 		providerNames[p.Name] = p
 	}
 	if len(providerNames) == 0 {
 		return errors.New("at least one provider is required")
+	}
+	for _, price := range c.Prices {
+		if err := price.Validate(); err != nil {
+			return fmt.Errorf("prices: %w", err)
+		}
+		if _, ok := providerNames[price.Provider]; !ok {
+			return fmt.Errorf("prices reference unknown provider %q", price.Provider)
+		}
 	}
 
 	modelNames := make(map[string]bool, len(c.Models))
@@ -156,6 +179,12 @@ func (c File) Validate() error {
 		if client.RPM < 0 {
 			return fmt.Errorf("client %q rpm cannot be negative", client.ID)
 		}
+		if client.TPM < 0 || client.BudgetMicros < 0 {
+			return fmt.Errorf("client %q tpm and budget_micros cannot be negative", client.ID)
+		}
+		if client.BudgetWindow != "" && !containsBudgetWindow(client.BudgetWindow) {
+			return fmt.Errorf("client %q has unknown budget_window %q", client.ID, client.BudgetWindow)
+		}
 		if _, ok := os.LookupEnv(client.KeyEnv); !ok || os.Getenv(client.KeyEnv) == "" {
 			return fmt.Errorf("client %q requires non-empty environment variable %s", client.ID, client.KeyEnv)
 		}
@@ -172,6 +201,15 @@ func (c File) Validate() error {
 		}
 	}
 	return nil
+}
+
+func containsBudgetWindow(value string) bool {
+	for _, allowed := range []string{"calendar_month", "rolling_30d", "rolling_24h"} {
+		if allowed == value {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePositiveDuration(raw string) (time.Duration, error) {

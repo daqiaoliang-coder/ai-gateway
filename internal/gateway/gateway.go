@@ -24,8 +24,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/daqiaoliang-coder/ai-gateway/internal/audit"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/config"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/cost"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/policy"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/quota"
 )
 
 // maxErrorBodyBytes bounds how much of a provider error response is buffered.
@@ -38,6 +41,21 @@ const maxResponseBytes = 16 << 20
 // starting another attempt.
 const minAttemptBudgetFloor = 5 * time.Second
 
+// Options carries everything the gateway needs beyond static operator config.
+// They are injected rather than constructed inside New so that a deployment can
+// choose its own store and audit sinks, and so tests can supply fakes.
+type Options struct {
+	Contract *policy.Contract
+	Logger   *slog.Logger
+	// Prices turns tokens into money; nil disables costing but not accounting.
+	Prices *cost.Table
+	// Quota enforces rate limits and budgets. nil means no quota enforcement,
+	// which is only appropriate for tests.
+	Quota *quota.Manager
+	// Recorder receives usage and quota events; nil discards them.
+	Recorder *audit.Recorder
+}
+
 type Gateway struct {
 	clients       map[string]*client
 	models        map[string]*modelRoute
@@ -47,11 +65,14 @@ type Gateway struct {
 	maxRequest    int64
 	maxConcurrent int
 	semaphore     chan struct{}
-	limiter       *rateLimiter
 	metrics       *metrics
 	logger        *slog.Logger
 
-	contract         *policy.Contract
+	contract *policy.Contract
+	prices   *cost.Table
+	quota    *quota.Manager
+	recorder *audit.Recorder
+
 	totalDeadline    time.Duration
 	attemptTimeout   time.Duration
 	minAttemptBudget time.Duration
@@ -60,14 +81,18 @@ type Gateway struct {
 	maxRetryAfter    time.Duration
 	streamMaxEvent   int64
 	streamMaxBytes   int64
+	reserveTTL       time.Duration
 	draining         atomic.Bool
 }
 
 type client struct {
-	id     string
-	key    []byte
-	models map[string]struct{}
-	rpm    int
+	id           string
+	key          []byte
+	models       map[string]struct{}
+	rpm          int
+	tpm          int64
+	budgetMicros int64
+	budgetWindow string
 }
 
 type provider struct {
@@ -77,6 +102,8 @@ type provider struct {
 	apiKey  string
 	http    *http.Client
 	breaker *circuitBreaker
+	// budgetMicros caps platform-wide spend for this provider.
+	budgetMicros int64
 
 	lastSuccessUnix atomic.Int64
 	lastFailureUnix atomic.Int64
@@ -91,10 +118,12 @@ type modelRoute struct {
 	next        atomic.Uint64
 }
 
-func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gateway, error) {
+func New(cfg config.File, opts Options) (*Gateway, error) {
+	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	contract := opts.Contract
 	if contract == nil {
 		contract = policy.Default()
 	}
@@ -127,6 +156,10 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 	if err != nil {
 		return nil, fmt.Errorf("invalid contract max_retry_after: %w", err)
 	}
+	reserveTTL, err := time.ParseDuration(contract.Quota.Store.ReservationTTL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid contract reservation_ttl: %w", err)
+	}
 
 	providers := make(map[string]*provider, len(cfg.Providers))
 	transport := &http.Transport{
@@ -157,12 +190,13 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 			}
 		}
 		providers[item.Name] = &provider{
-			name:    item.Name,
-			baseURL: parsed,
-			model:   item.Model,
-			apiKey:  apiKey,
-			http:    upstreamClient,
-			breaker: newCircuitBreaker(cfg.BreakerFailures, time.Duration(cfg.BreakerOpenSeconds)*time.Second),
+			name:         item.Name,
+			baseURL:      parsed,
+			model:        item.Model,
+			apiKey:       apiKey,
+			http:         upstreamClient,
+			breaker:      newCircuitBreaker(cfg.BreakerFailures, time.Duration(cfg.BreakerOpenSeconds)*time.Second),
+			budgetMicros: item.BudgetMicros,
 		}
 	}
 
@@ -173,10 +207,12 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 		maxRequest:     cfg.MaxRequestBytes,
 		maxConcurrent:  cfg.MaxConcurrentRequests,
 		semaphore:      make(chan struct{}, cfg.MaxConcurrentRequests),
-		limiter:        newRateLimiter(),
 		metrics:        &metrics{},
 		logger:         logger,
 		contract:       contract,
+		prices:         opts.Prices,
+		quota:          opts.Quota,
+		recorder:       opts.Recorder,
 		totalDeadline:  totalDeadline,
 		attemptTimeout: attemptTimeout,
 		backoffInitial: backoffInitial,
@@ -184,6 +220,7 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 		maxRetryAfter:  maxRetryAfter,
 		streamMaxEvent: contract.Streaming.MaxEventBytes,
 		streamMaxBytes: contract.Streaming.MaxStreamBytes,
+		reserveTTL:     reserveTTL,
 	}
 	g.minAttemptBudget = attemptTimeout
 	if g.minAttemptBudget > minAttemptBudgetFloor {
@@ -204,7 +241,15 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 		for _, name := range item.AllowedModels {
 			allowed[name] = struct{}{}
 		}
-		g.clients[item.ID] = &client{id: item.ID, key: []byte(key), models: allowed, rpm: item.RPM}
+		g.clients[item.ID] = &client{
+			id:           item.ID,
+			key:          []byte(key),
+			models:       allowed,
+			rpm:          item.RPM,
+			tpm:          item.TPM,
+			budgetMicros: item.BudgetMicros,
+			budgetWindow: item.BudgetWindow,
+		}
 	}
 	for _, item := range cfg.Models {
 		route := &modelRoute{name: item.Name}
@@ -223,6 +268,14 @@ func New(cfg config.File, contract *policy.Contract, logger *slog.Logger) (*Gate
 		g.providerList = append(g.providerList, providers[name])
 	}
 	sort.Slice(g.providerList, func(i, j int) bool { return g.providerList[i].name < g.providerList[j].name })
+
+	if opts.Prices != nil && contract.Usage.PriceVersionRequired {
+		for _, upstream := range providers {
+			if _, found := opts.Prices.Lookup(upstream.name, upstream.model); !found {
+				return nil, fmt.Errorf("provider %q has no price for model %q and price_version_required is true", upstream.name, upstream.model)
+			}
+		}
+	}
 
 	logger.Info("behavior contract in effect",
 		"total_deadline", contract.Timeouts.TotalDeadline,
@@ -391,12 +444,6 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	callerID = caller.id
-	if caller.rpm > 0 && !g.limiter.allow(caller.id, caller.rpm) {
-		setRetryAfter(w, time.Second)
-		writeError(w, http.StatusTooManyRequests, policy.CodeRateLimitExceeded, "client request rate limit exceeded", requestID(r.Context()))
-		status = http.StatusTooManyRequests
-		return
-	}
 	select {
 	case g.semaphore <- struct{}{}:
 		defer func() { <-g.semaphore }()
@@ -457,6 +504,18 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Reserve budget before sending anything upstream: once tokens are generated
+	// there is no way to un-spend them. The reservation is keyed by request id so
+	// a retry cannot consume the tenant's budget twice.
+	reserved := g.reserve(ctx, caller, selectedModel, route, requestID(ctx), body, request.Stream)
+	if !reserved.decision.Allowed {
+		status = http.StatusTooManyRequests
+		setRetryAfter(w, time.Second)
+		writeError(w, status, reserved.code, reserved.message, requestID(ctx))
+		completion = policy.StreamAbortedGateway
+		return
+	}
+
 	result := g.forward(w, r, route, body, request.Stream)
 	status = result.status
 	selectedProvider = result.provider
@@ -465,6 +524,258 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	completion = result.completion
 	outcome = result.outcome
 	attempts = result.attempts
+	g.account(ctx, reserved, result, caller, selectedModel, selectedProvider, inputTokens, outputTokens)
+}
+
+// reservation captures what a request held so it can be settled afterwards.
+type reservation struct {
+	plan     quota.Plan
+	decision quota.Decision
+	code     string
+	message  string
+	active   bool
+}
+
+// estimateTokens guesses how many tokens a request will cost. It only has to be
+// good enough to hold a sensible amount; the settle step replaces it with the
+// real numbers.
+func estimateTokens(body []byte, stream bool, reserveOutput int64) (input, output int64) {
+	chars := int64(len(body))
+	if chars > 0 {
+		input = chars / 4
+	}
+	output = reserveOutput
+	if !stream && output == 0 {
+		output = input
+	}
+	return input, output
+}
+
+func (g *Gateway) reserve(ctx context.Context, caller *client, model string, route *modelRoute, id string, body []byte, stream bool) reservation {
+	if g.quota == nil {
+		// No store means no enforcement. Tests and single-purpose deployments
+		// rely on this, but it must never be the production default.
+		return reservation{decision: quota.Decision{Allowed: true, Reason: "quota_disabled"}}
+	}
+	result := reservation{}
+	window := caller.budgetWindow
+	if window == "" {
+		window = g.contract.Quota.BudgetWindow
+	}
+	primary := ""
+	if len(route.deployments) > 0 {
+		primary = route.deployments[0].name
+	}
+	inputTokens, outputTokens := estimateTokens(body, stream, g.contract.Quota.StreamReserveTokens)
+
+	micros := int64(0)
+	if price, found := g.prices.Lookup(primary, route.deployments[0].model); found && len(route.deployments) > 0 {
+		micros = int64(price.Cost(false, inputTokens) + price.Cost(true, outputTokens) + price.RequestRate)
+	}
+
+	plan, err := quota.BuildPlan(quota.Config{
+		Tenant:             caller.id,
+		Model:              model,
+		Provider:           primary,
+		TenantRPM:          caller.rpm,
+		TenantTPM:          caller.tpm,
+		TenantBudgetMicros: caller.budgetMicros,
+		Window:             window,
+	}, id, inputTokens+outputTokens, micros, g.reserveTTL, time.Now())
+	if err != nil {
+		g.logger.Error("quota plan could not be built", "request_id", id, "error", err)
+		result.decision = quota.Decision{Allowed: true, Reason: "plan_error"}
+		return result
+	}
+
+	decision, err := g.quota.Reserve(ctx, plan)
+	if err != nil {
+		// A store failure must not take the gateway down; the manager already
+		// applied the configured degradation, and anything left over is logged.
+		g.logger.Error("quota reserve failed", "request_id", id, "error", err)
+		result.decision = quota.Decision{Allowed: true, Reason: "reserve_error"}
+		return result
+	}
+	result.plan = plan
+	result.decision = decision
+	result.active = decision.Allowed
+	if decision.Allowed {
+		return result
+	}
+
+	switch decision.DeniedKind {
+	case quota.KindTokens:
+		result.code, result.message = policy.CodeTokenRateLimit, "client token rate limit exceeded"
+	case quota.KindBudget:
+		result.code, result.message = policy.CodeBudgetExceeded, "client budget exhausted for the current window"
+	default:
+		result.code, result.message = policy.CodeRateLimitExceeded, "client request rate limit exceeded"
+	}
+	g.emitQuota(ctx, plan, decision)
+	return result
+}
+
+// account settles the reservation with real usage and emits the usage event that
+// makes cost reconcilable by tenant, model and provider.
+func (g *Gateway) account(ctx context.Context, reserved reservation, result forwardResult, caller *client, model, provider string, inputTokens, outputTokens int64) {
+	settlement := g.settle(ctx, reserved, result.provider, model, provider, inputTokens, outputTokens)
+	if g.recorder == nil || !reserved.active {
+		return
+	}
+	g.recorder.Usage(audit.UsageEvent{
+		Timestamp:       time.Now().UTC(),
+		RequestID:       requestID(ctx),
+		AttemptID:       reserved.plan.ID,
+		Tenant:          caller.id,
+		Client:          caller.id,
+		Model:           model,
+		UpstreamModel:   model,
+		Provider:        settlement.provider,
+		Status:          result.status,
+		DurationMS:      0,
+		InputTokens:     settlement.usage.InputTokens,
+		OutputTokens:    settlement.usage.OutputTokens,
+		UsageReported:   settlement.usage.Reported,
+		Reconciliation:  string(settlement.status),
+		StreamComplete:  string(result.completion),
+		Currency:        settlement.line.Currency,
+		PriceVersion:    settlement.line.Version,
+		PriceFound:      settlement.found,
+		TotalMicros:     int64(settlement.line.Total),
+		InputCostMicros: int64(settlement.line.InputCost),
+		OutputCostMicro: int64(settlement.line.OutputCost),
+	})
+}
+
+type settlementResult struct {
+	line     cost.Line
+	usage    cost.Usage
+	status   cost.Status
+	found    bool
+	provider string
+}
+
+// settle converts held budget into real spend, or returns it when nothing was
+// generated.
+func (g *Gateway) settle(ctx context.Context, reserved reservation, provider, model, alias string, inputTokens, outputTokens int64) settlementResult {
+	complete := reserved.decision.Allowed
+	usage := cost.Usage{InputTokens: inputTokens, OutputTokens: outputTokens, Reported: inputTokens > 0 || outputTokens > 0}
+	settled := settlementResult{usage: usage, provider: provider, status: cost.StatusOK}
+
+	if g.prices != nil && provider != "" {
+		upstreamModel := model
+		if g.prices != nil {
+			if target, ok := g.providerByName(provider); ok {
+				upstreamModel = target.model
+			}
+		}
+		policy_ := cost.Estimate
+		switch g.contract.Usage.MissingUsagePolicy {
+		case "reject":
+			policy_ = cost.Reject
+		case "allow_zero":
+			policy_ = cost.AllowZero
+		}
+		line, err := g.prices.Settle(provider, upstreamModel, usage, complete, policy_, cost.CharEstimator{CharsPerToken: 4}, inputTokens*4, outputTokens*4)
+		if err != nil {
+			g.logger.Warn("usage could not be settled", "request_id", requestID(ctx), "error", err)
+		}
+		settled.line = line.Line
+		settled.usage = line.Usage
+		settled.status = line.Status
+		settled.found = line.PriceFound
+		settled.provider = provider
+	}
+	if !complete {
+		settled.status = cost.StatusPartial
+	}
+
+	if g.quota == nil {
+		return settled
+	}
+	actuals := make([]int64, len(reserved.plan.Lines))
+	for i, line := range reserved.plan.Lines {
+		switch line.Kind {
+		case quota.KindRequests:
+			actuals[i] = 1
+		case quota.KindTokens:
+			actuals[i] = settled.usage.InputTokens + settled.usage.OutputTokens
+		case quota.KindBudget:
+			actuals[i] = int64(settled.line.Total)
+		}
+	}
+	if err := g.quota.Settle(ctx, quota.Settlement{ID: reserved.plan.ID, Actuals: actuals}); err != nil {
+		if !errors.Is(err, quota.ErrUnknownReservation) {
+			g.logger.Error("quota settle failed", "request_id", requestID(ctx), "error", err)
+		}
+	}
+	g.chargeProviderBudget(ctx, provider, int64(settled.line.Total), reserved.plan.ID)
+	return settled
+}
+
+// chargeProviderBudget books platform-wide provider spend after the fact. It
+// cannot be part of the pre-flight plan because which provider answers is known
+// only once the request completed.
+func (g *Gateway) chargeProviderBudget(ctx context.Context, providerName string, micros int64, attemptID string) {
+	if g.quota == nil || micros <= 0 {
+		return
+	}
+	target, ok := g.providerByName(providerName)
+	if !ok || target.budgetMicros <= 0 {
+		return
+	}
+	plan, err := quota.BuildPlan(quota.Config{
+		Provider:             target.name,
+		Model:                target.model,
+		Window:               g.contract.Quota.BudgetWindow,
+		ProviderBudgetMicros: target.budgetMicros,
+	}, attemptID+":provider:"+target.name, 0, micros, g.reserveTTL, time.Now())
+	if err != nil {
+		g.logger.Error("provider budget plan failed", "provider", providerName, "error", err)
+		return
+	}
+	decision, err := g.quota.Reserve(ctx, plan)
+	if err != nil {
+		g.logger.Error("provider budget reserve failed", "provider", providerName, "error", err)
+		return
+	}
+	if !decision.Allowed {
+		g.logger.Warn("provider budget exhausted",
+			"provider", providerName, "window", decision.DeniedKey, "remaining", decision.Remaining)
+		g.emitQuota(ctx, plan, decision)
+		return
+	}
+	if err := g.quota.Settle(ctx, quota.Settlement{ID: plan.ID, Actuals: []int64{micros}}); err != nil {
+		g.logger.Error("provider budget settle failed", "provider", providerName, "error", err)
+	}
+}
+
+func (g *Gateway) emitQuota(ctx context.Context, plan quota.Plan, decision quota.Decision) {
+	if g.recorder == nil {
+		return
+	}
+	g.recorder.Quota(audit.QuotaEvent{
+		Timestamp: time.Now().UTC(),
+		RequestID: plan.ID,
+		AttemptID: plan.ID,
+		Tenant:    plan.Tenant,
+		Model:     plan.Model,
+		Provider:  plan.Provider,
+		Action:    "reserve",
+		Denied:    !decision.Allowed,
+		WindowKey: decision.DeniedKey,
+		Reason:    decision.Reason,
+		Degraded:  decision.Degraded,
+	})
+}
+
+func (g *Gateway) providerByName(name string) (*provider, bool) {
+	for _, target := range g.providerList {
+		if target.name == name {
+			return target, true
+		}
+	}
+	return nil, false
 }
 
 func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request) (*client, bool) {
@@ -997,44 +1308,6 @@ func writeErrorWithProvider(w http.ResponseWriter, status int, code, message, id
 		payload["provider_status"] = providerStatus
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": payload})
-}
-
-// rateLimiter is process-local. Multi-replica deployments should replace it
-// with a shared limiter before relying on strict fleet-wide RPM enforcement.
-type rateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]bucket
-}
-
-type bucket struct {
-	tokens float64
-	last   time.Time
-}
-
-func newRateLimiter() *rateLimiter {
-	return &rateLimiter{buckets: make(map[string]bucket)}
-}
-
-func (l *rateLimiter) allow(key string, rpm int) bool {
-	now := time.Now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	b, ok := l.buckets[key]
-	if !ok {
-		b = bucket{tokens: float64(rpm), last: now}
-	}
-	b.tokens += now.Sub(b.last).Seconds() * float64(rpm) / 60
-	if b.tokens > float64(rpm) {
-		b.tokens = float64(rpm)
-	}
-	b.last = now
-	if b.tokens < 1 {
-		l.buckets[key] = b
-		return false
-	}
-	b.tokens--
-	l.buckets[key] = b
-	return true
 }
 
 type circuitBreaker struct {

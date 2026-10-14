@@ -12,7 +12,9 @@
       "id": "demo-app",
       "key_env": "AI_GATEWAY_CLIENT_KEY",
       "allowed_models": ["fast"],
-      "rpm": 60
+      "rpm": 60,
+      "tpm": 200000,
+      "budget_micros": 50000000
     }
   ],
   "providers": [
@@ -20,19 +22,45 @@
       "name": "openai-primary",
       "base_url": "https://api.openai.com/v1",
       "model": "gpt-4.1-mini",
-      "api_key_env": "OPENAI_API_KEY"
+      "api_key_env": "OPENAI_API_KEY",
+      "budget_micros": 500000000
     },
     {
       "name": "compatible-backup",
       "base_url": "https://llm-backup.example.com/v1",
       "model": "backup-chat-model",
-      "api_key_env": "BACKUP_API_KEY"
+      "api_key_env": "BACKUP_API_KEY",
+      "budget_micros": 100000000
     }
   ],
   "models": [
     {
       "name": "fast",
       "deployments": ["openai-primary", "compatible-backup"]
+    }
+  ],
+  "prices": [
+    {
+      "model": "gpt-4.1-mini",
+      "provider": "openai-primary",
+      "currency": "USD",
+      "unit": "1m_tokens",
+      "version": "2026-01",
+      "input_rate": 400000,
+      "output_rate": 1600000,
+      "request_rate": 0,
+      "effective_at": "2026-01-01T00:00:00Z"
+    },
+    {
+      "model": "backup-chat-model",
+      "provider": "compatible-backup",
+      "currency": "USD",
+      "unit": "1m_tokens",
+      "version": "2026-01",
+      "input_rate": 300000,
+      "output_rate": 1200000,
+      "request_rate": 0,
+      "effective_at": "2026-01-01T00:00:00Z"
     }
   ]
 }

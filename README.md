@@ -30,6 +30,21 @@ flowchart LR
 - 熔断器、请求体上限、上游超时、优雅关停、请求 ID 和结构化日志。
 - API 密钥只从环境变量读取；日志不包含提示词或响应正文。
 
+### 共享限额与成本核算
+
+- **速率与预算分开**：每租户 RPM、TPM 和金额预算是三个独立维度，各自返回自己的错误码（`rate_limit_exceeded` / `token_rate_limit_exceeded` / `budget_exceeded`）。平台级供应商预算单独按供应商核账。
+- **预留—核账—释放**：请求前预留，响应后按实际用量核账。以请求 ID 作为幂等键，重试不会重复扣账；预留带 TTL，进程崩溃后由清扫器归还。
+- **跨副本共享**：`quota.store.mode = shared` 时状态放在 Redis，全部判定在 Lua 脚本里原子执行，多副本共用一个租户额度。`mode = local` 用进程内实现，仅限单实例。共享存储不可用时按 `on_unavailable` 降级：默认 `degrade`，用本地桶按 `degrade_factor` 降额运行。
+- **金额用微单位整数累计**，价格表版本化（计价单位、币种、生效版本），用量缺失按 `missing_usage_policy` 处理并标记对账状态，不把「没上报」当成「免费」。
+- **用量审计事件**异步写出（stdout 或追加写文件），不阻塞请求路径；队列满时丢弃并计数。事件可按租户、模型、供应商追溯用量与费用。
+
+本地跑 Redis 集成测试（默认跳过）：
+
+```sh
+docker run -d --rm -p 6399:6379 redis:7-alpine
+AI_GATEWAY_REDIS_TEST_ADDR=127.0.0.1:6399 go test ./internal/quota/
+```
+
 ### 请求正确性与故障处理
 
 - **一个总时限**：`timeouts.total_deadline` 覆盖全部重试，每次尝试不再重新计时；剩余时限不足时不再发起新尝试。

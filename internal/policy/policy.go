@@ -84,6 +84,21 @@ type Store struct {
 	OnUnavailable  string  `json:"on_unavailable"`
 	DegradeFactor  float64 `json:"degrade_factor"`
 	ReservationTTL string  `json:"reservation_ttl"`
+	Redis          Redis   `json:"redis"`
+	SweepInterval  string  `json:"sweep_interval"`
+}
+
+// Redis configures the shared atomic store. KeyPrefix namespaces counters so one
+// Redis instance can host several environments.
+type Redis struct {
+	Addr         string `json:"addr"`
+	PasswordEnv  string `json:"password_env,omitempty"`
+	DB           int    `json:"db"`
+	PoolSize     int    `json:"pool_size"`
+	DialTimeout  string `json:"dial_timeout"`
+	ReadTimeout  string `json:"read_timeout"`
+	WriteTimeout string `json:"write_timeout"`
+	KeyPrefix    string `json:"key_prefix"`
 }
 
 // Usage controls token and cost accounting.
@@ -92,6 +107,9 @@ type Usage struct {
 	PriceVersionRequired bool   `json:"price_version_required"`
 	EmitAuditEvents      bool   `json:"emit_audit_events"`
 	AuditSink            string `json:"audit_sink"`
+	// AuditFilePath is required once durable storage is selected; without it
+	// there is nothing to reconcile against later.
+	AuditFilePath string `json:"audit_file_path,omitempty"`
 }
 
 // Streaming bounds a single SSE event and the whole streamed response, and
@@ -203,6 +221,27 @@ func (c *Contract) defaults() {
 	if c.Quota.Store.ReservationTTL == "" {
 		c.Quota.Store.ReservationTTL = "10m"
 	}
+	if c.Quota.Store.SweepInterval == "" {
+		c.Quota.Store.SweepInterval = "1m"
+	}
+	if c.Quota.Store.Redis.Addr == "" {
+		c.Quota.Store.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Quota.Store.Redis.PoolSize == 0 {
+		c.Quota.Store.Redis.PoolSize = 8
+	}
+	if c.Quota.Store.Redis.DialTimeout == "" {
+		c.Quota.Store.Redis.DialTimeout = "2s"
+	}
+	if c.Quota.Store.Redis.ReadTimeout == "" {
+		c.Quota.Store.Redis.ReadTimeout = "2s"
+	}
+	if c.Quota.Store.Redis.WriteTimeout == "" {
+		c.Quota.Store.Redis.WriteTimeout = "2s"
+	}
+	if c.Quota.Store.Redis.KeyPrefix == "" {
+		c.Quota.Store.Redis.KeyPrefix = "ai-gateway"
+	}
 	if c.Quota.StreamReserveTokens == 0 {
 		c.Quota.StreamReserveTokens = 4096
 	}
@@ -219,7 +258,9 @@ func (c *Contract) defaults() {
 		c.Usage.EmitAuditEvents = true
 	}
 	if c.Usage.AuditSink == "" {
-		c.Usage.AuditSink = "both"
+		// Durability is opt-in because it needs a writable path; deployments that
+		// want reconciliation select durable or both in configs/policy.example.json.
+		c.Usage.AuditSink = "stdout"
 	}
 	if c.Streaming.MaxEventBytes == 0 {
 		c.Streaming.MaxEventBytes = 256 << 10
@@ -371,6 +412,28 @@ func (c *Contract) Validate() error {
 	if ttl > 24*time.Hour {
 		return fmt.Errorf("quota.store.reservation_ttl (%s) must not exceed 24h", ttl)
 	}
+	sweep, err := parsePositiveDuration(c.Quota.Store.SweepInterval)
+	if err != nil {
+		return fmt.Errorf("quota.store.sweep_interval: %w", err)
+	}
+	if sweep > time.Hour {
+		return fmt.Errorf("quota.store.sweep_interval (%s) must not exceed 1h", sweep)
+	}
+	if _, err := parsePositiveDuration(c.Quota.Store.Redis.DialTimeout); err != nil {
+		return fmt.Errorf("quota.store.redis.dial_timeout: %w", err)
+	}
+	if _, err := parsePositiveDuration(c.Quota.Store.Redis.ReadTimeout); err != nil {
+		return fmt.Errorf("quota.store.redis.read_timeout: %w", err)
+	}
+	if _, err := parsePositiveDuration(c.Quota.Store.Redis.WriteTimeout); err != nil {
+		return fmt.Errorf("quota.store.redis.write_timeout: %w", err)
+	}
+	if c.Quota.Store.Redis.PoolSize < 1 {
+		return errors.New("quota.store.redis.pool_size must be at least 1")
+	}
+	if c.Quota.Store.Mode == "shared" && c.Quota.Store.Redis.Addr == "" {
+		return errors.New("quota.store.mode shared requires quota.store.redis.addr")
+	}
 	if c.Quota.StreamReserveTokens <= 0 {
 		return errors.New("quota.stream_reserve_tokens must be positive")
 	}
@@ -383,6 +446,11 @@ func (c *Contract) Validate() error {
 	}
 	if !contains(auditSinks, c.Usage.AuditSink) {
 		return fmt.Errorf("usage.audit_sink must be one of %v, got %q", auditSinks, c.Usage.AuditSink)
+	}
+	// Claiming durable storage without somewhere durable to put it is exactly the
+	// kind of gap that shows up during an incident.
+	if c.Usage.EmitAuditEvents && (c.Usage.AuditSink == "durable" || c.Usage.AuditSink == "both") && c.Usage.AuditFilePath == "" {
+		return errors.New("usage.audit_sink durable requires usage.audit_file_path")
 	}
 
 	if c.Streaming.MaxEventBytes <= 0 || c.Streaming.MaxStreamBytes <= 0 {
@@ -614,6 +682,7 @@ const (
 	CodeInvalidRequest      = "invalid_request"
 	CodeRequestTooLarge     = "request_too_large"
 	CodeRateLimitExceeded   = "rate_limit_exceeded"
+	CodeTokenRateLimit      = "token_rate_limit_exceeded"
 	CodeBudgetExceeded      = "budget_exceeded"
 	CodeGatewayOverloaded   = "gateway_overloaded"
 	CodeUpstreamUnavailable = "upstream_unavailable"
@@ -634,6 +703,7 @@ var GatewayErrorCodes = []string{
 	CodeInvalidRequest,
 	CodeRequestTooLarge,
 	CodeRateLimitExceeded,
+	CodeTokenRateLimit,
 	CodeBudgetExceeded,
 	CodeGatewayOverloaded,
 	CodeUpstreamUnavailable,

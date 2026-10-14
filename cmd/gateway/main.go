@@ -11,9 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daqiaoliang-coder/ai-gateway/internal/audit"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/config"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/cost"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/gateway"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/policy"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/quota"
 )
 
 func main() {
@@ -40,7 +43,56 @@ func main() {
 			"total_deadline", contract.Timeouts.TotalDeadline,
 			"max_attempts", contract.Retry.MaxAttempts)
 	}
-	service, err := gateway.New(cfg, contract, logger)
+
+	prices, err := cost.NewTable(cfg.Prices)
+	if err != nil {
+		logger.Error("price table error", "error", err)
+		os.Exit(2)
+	}
+
+	// Quota state is shared across replicas, so multi-replica deployments obey
+	// one tenant budget instead of one per pod. When it cannot be reached, the
+	// contract decides whether to degrade, fail open or fail closed.
+	quotaMgr, err := quota.NewManagerFromContract(contract, nil)
+	if err != nil {
+		logger.Error("quota store unavailable at startup",
+			"mode", contract.Quota.Store.Mode,
+			"addr", contract.Quota.Store.Redis.Addr,
+			"error", err,
+			"hint", "start Redis, or set quota.store.mode to local for single instance deployments")
+		os.Exit(2)
+	}
+	defer quotaMgr.Close()
+
+	sweepCtx, stopSweeper := context.WithCancel(context.Background())
+	defer stopSweeper()
+	sweepInterval, _ := time.ParseDuration(contract.Quota.Store.SweepInterval)
+	quotaMgr.StartSweeper(sweepCtx, sweepInterval, func(released int) {
+		logger.Info("reclaimed expired reservations", "count", released)
+	})
+
+	recorder, err := newRecorder(contract)
+	if err != nil {
+		logger.Error("audit sink error", "error", err)
+		os.Exit(2)
+	}
+	if recorder != nil {
+		recorder.Start()
+		defer func() {
+			if err := recorder.Stop(); err != nil {
+				logger.Error("audit sink close failed", "error", err)
+			}
+			logger.Info("audit events written", "written", recorder.Written(), "dropped", recorder.Dropped(), "failed", recorder.Failed())
+		}()
+	}
+
+	service, err := gateway.New(cfg, gateway.Options{
+		Contract: contract,
+		Logger:   logger,
+		Prices:   prices,
+		Quota:    quotaMgr,
+		Recorder: recorder,
+	})
 	if err != nil {
 		logger.Error("gateway initialization error", "error", err)
 		os.Exit(2)
@@ -88,4 +140,28 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// newRecorder builds the audit pipeline the contract asks for. The recorder is
+// asynchronous, so a slow or full sink never blocks a request.
+func newRecorder(contract *policy.Contract) (*audit.Recorder, error) {
+	if !contract.Usage.EmitAuditEvents {
+		return nil, nil
+	}
+	var sinks []audit.Sink
+	switch contract.Usage.AuditSink {
+	case "stdout", "both":
+		sinks = append(sinks, audit.NewStdoutSink(os.Stdout))
+	}
+	if contract.Usage.AuditSink == "durable" || contract.Usage.AuditSink == "both" {
+		fileSink, err := audit.NewFileSink(contract.Usage.AuditFilePath)
+		if err != nil {
+			return nil, err
+		}
+		sinks = append(sinks, fileSink)
+	}
+	if len(sinks) == 0 {
+		return nil, nil
+	}
+	return audit.NewRecorder(sinks, 4096), nil
 }

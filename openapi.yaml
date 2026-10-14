@@ -155,6 +155,7 @@ components:
                 - invalid_request
                 - request_too_large
                 - rate_limit_exceeded
+                - token_rate_limit_exceeded
                 - budget_exceeded
                 - gateway_overloaded
                 - upstream_unavailable

@@ -3,17 +3,22 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/daqiaoliang-coder/ai-gateway/internal/audit"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/cost"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/policy"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/quota"
 )
 
 const testKey = "test-client-key"
@@ -83,7 +88,6 @@ func newTestGateway(t *testing.T, contract *policy.Contract, upstreams ...*testU
 		maxRequest:       1 << 20,
 		maxConcurrent:    8,
 		semaphore:        make(chan struct{}, 8),
-		limiter:          newRateLimiter(),
 		metrics:          &metrics{},
 		logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		contract:         contract,
@@ -689,5 +693,252 @@ func TestWaitBeforeRetryRespectsTotalDeadline(t *testing.T) {
 
 	if g.waitBeforeRetry(ctx, 1, 5*time.Second) {
 		t.Fatal("expected the deadline to abort the retry wait")
+	}
+}
+
+// ---------- Stage 2: shared quotas and cost accounting ----------
+
+type countingStore struct {
+	inner    *quota.MemoryStore
+	reserved atomic.Int64
+	settled  atomic.Int64
+}
+
+func (c *countingStore) Reserve(ctx context.Context, plan quota.Plan) (quota.Decision, error) {
+	c.reserved.Add(1)
+	return c.inner.Reserve(ctx, plan)
+}
+func (c *countingStore) Settle(ctx context.Context, s quota.Settlement) error {
+	c.settled.Add(1)
+	return c.inner.Settle(ctx, s)
+}
+func (c *countingStore) Abandon(ctx context.Context, id string) error {
+	return c.inner.Abandon(ctx, id)
+}
+func (c *countingStore) Sweep(ctx context.Context, keys []string, now time.Time) (int, error) {
+	return c.inner.Sweep(ctx, keys, now)
+}
+func (c *countingStore) Close() error { return nil }
+
+type capturingSink struct {
+	mu    sync.Mutex
+	usage []audit.UsageEvent
+	quota []audit.QuotaEvent
+}
+
+func (s *capturingSink) WriteUsage(_ context.Context, event audit.UsageEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage = append(s.usage, event)
+	return nil
+}
+func (s *capturingSink) WriteQuota(_ context.Context, event audit.QuotaEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quota = append(s.quota, event)
+	return nil
+}
+func (s *capturingSink) Close() error { return nil }
+
+func (s *capturingSink) usageCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.usage)
+}
+
+func (s *capturingSink) usageSnapshot() []audit.UsageEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]audit.UsageEvent(nil), s.usage...)
+}
+
+// priceTableFor builds a versioned price table matching the test upstreams.
+func priceTableFor(t *testing.T, providers ...string) *cost.Table {
+	t.Helper()
+	prices := make([]cost.Price, 0, len(providers))
+	for _, name := range providers {
+		prices = append(prices, cost.Price{
+			Model: "upstream-model", Provider: name, Currency: "USD", Unit: cost.UnitToken,
+			Version: "2026-01", InputRate: 1, OutputRate: 4,
+		})
+	}
+	table, err := cost.NewTable(prices)
+	if err != nil {
+		t.Fatalf("price table: %v", err)
+	}
+	return table
+}
+
+// enableQuota wires a store, prices and a recorder onto a test gateway.
+func enableQuota(t *testing.T, g *Gateway, shared quota.Store, recorder *audit.Recorder, upstreams ...string) {
+	t.Helper()
+	g.quota = quota.NewManager(shared, quota.NewMemoryStore(), "degrade", 0.5, nil)
+	g.prices = priceTableFor(t, upstreams...)
+	g.recorder = recorder
+	g.reserveTTL = time.Minute
+}
+
+func setTenantQuota(g *Gateway, rpm int, tpm, budgetMicros int64) {
+	g.clients["test"].rpm = rpm
+	g.clients["test"].tpm = tpm
+	g.clients["test"].budgetMicros = budgetMicros
+}
+
+func successUpstream(tokens int64) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"usage":{"prompt_tokens":10,"completion_tokens":%d}}`, tokens)))
+	}
+}
+
+// Acceptance: money is a dimension of its own. A tenant can be well inside its
+// request rate and still be out of budget.
+func TestBudgetExhaustionBlocksTheNextRequest(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	contract.Quota.Store.Mode = "local"
+	primary := newUpstream(t, "primary", successUpstream(20))
+	g := newTestGateway(t, contract, primary)
+	enableQuota(t, g, quota.NewMemoryStore(), nil, "primary")
+	setTenantQuota(g, 0, 0, 300)
+
+	first := postChat(t, g, chatBody("fast", false))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200: %s", first.Code, first.Body.String())
+	}
+
+	second := postChat(t, g, chatBody("fast", false))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request = %d, want 429", second.Code)
+	}
+	if got := errorCode(t, second); got != policy.CodeBudgetExceeded {
+		t.Fatalf("code = %s, want %s", got, policy.CodeBudgetExceeded)
+	}
+	if primary.calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1: a budget refusal must not reach the provider", primary.calls.Load())
+	}
+}
+
+func TestRequestRateLimitIsSeparateFromBudget(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.Store.Mode = "local"
+	primary := newUpstream(t, "primary", successUpstream(20))
+	g := newTestGateway(t, contract, primary)
+	enableQuota(t, g, quota.NewMemoryStore(), nil, "primary")
+	setTenantQuota(g, 1, 0, 0)
+
+	if got := postChat(t, g, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", got.Code)
+	}
+	second := postChat(t, g, chatBody("fast", false))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request = %d, want 429", second.Code)
+	}
+	if got := errorCode(t, second); got != policy.CodeRateLimitExceeded {
+		t.Fatalf("code = %s, want %s", got, policy.CodeRateLimitExceeded)
+	}
+}
+
+// Acceptance: replicas share one tenant budget. Under process-local counters
+// each replica would have handed out the full amount.
+func TestReplicasShareOneTenantBudget(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	contract.Quota.Store.Mode = "local"
+	shared := quota.NewMemoryStore()
+
+	replicaAUpstream := newUpstream(t, "primary", successUpstream(20))
+	replicaBUpstream := newUpstream(t, "primary", successUpstream(20))
+	replicaA := newTestGateway(t, contract, replicaAUpstream)
+	replicaB := newTestGateway(t, contract, replicaBUpstream)
+	enableQuota(t, replicaA, shared, nil, "primary")
+	enableQuota(t, replicaB, shared, nil, "primary")
+	setTenantQuota(replicaA, 0, 0, 300)
+	setTenantQuota(replicaB, 0, 0, 300)
+
+	if got := postChat(t, replicaA, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("replica A = %d, want 200: %s", got.Code, got.Body.String())
+	}
+	second := postChat(t, replicaB, chatBody("fast", false))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("replica B = %d, want 429: the budget must be shared, not per replica", second.Code)
+	}
+	if replicaBUpstream.calls.Load() != 0 {
+		t.Fatalf("replica B upstream calls = %d, want 0", replicaBUpstream.calls.Load())
+	}
+}
+
+// Acceptance: a completed request is traceable by tenant, model and provider
+// with a real cost attached.
+func TestUsageEventIsTraceableByTenantModelAndProvider(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	contract.Quota.Store.Mode = "local"
+	primary := newUpstream(t, "primary", successUpstream(20))
+	g := newTestGateway(t, contract, primary)
+	sink := &capturingSink{}
+	recorder := audit.NewRecorder([]audit.Sink{sink}, 16)
+	recorder.Start()
+	defer func() { _ = recorder.Stop() }()
+	enableQuota(t, g, quota.NewMemoryStore(), recorder, "primary")
+	setTenantQuota(g, 0, 0, 100000)
+
+	if got := postChat(t, g, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", got.Code, got.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for sink.usageCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	events := sink.usageSnapshot()
+	if len(events) != 1 {
+		t.Fatalf("usage events = %d, want 1", len(events))
+	}
+	event := events[0]
+	if event.Tenant != "test" || event.Model != "fast" || event.Provider != "primary" {
+		t.Fatalf("event identity = tenant %q model %q provider %q", event.Tenant, event.Model, event.Provider)
+	}
+	if event.InputTokens != 10 || event.OutputTokens != 20 {
+		t.Fatalf("usage = %d/%d, want 10/20", event.InputTokens, event.OutputTokens)
+	}
+	// 10 input at 1 micro and 20 output at 4 micros.
+	if event.TotalMicros != 10+80 {
+		t.Fatalf("total = %d, want 90 micros", event.TotalMicros)
+	}
+	if event.Reconciliation != string(cost.StatusOK) {
+		t.Fatalf("reconciliation = %s, want ok", event.Reconciliation)
+	}
+	if !event.PriceFound || event.PriceVersion == "" {
+		t.Fatalf("price found = %v version = %q, want true and a version", event.PriceFound, event.PriceVersion)
+	}
+}
+
+// A request that fails with an uncertain outcome is charged exactly once, which
+// is what stage 1's no-replay rule means in money terms.
+func TestUncertainFailureIsChargedOnce(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	contract.Quota.Store.Mode = "local"
+	primary := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	g := newTestGateway(t, contract, primary)
+	store := &countingStore{inner: quota.NewMemoryStore()}
+	enableQuota(t, g, store, nil, "primary")
+	setTenantQuota(g, 0, 10000, 100000)
+
+	recorder := postChat(t, g, chatBody("fast", false))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", recorder.Code)
+	}
+	if store.reserved.Load() != 1 {
+		t.Fatalf("reserve calls = %d, want 1", store.reserved.Load())
+	}
+	if store.settled.Load() > 1 {
+		t.Fatalf("settle calls = %d, must not exceed 1", store.settled.Load())
+	}
+	if pending := store.inner.PendingIDs(); len(pending) != 0 {
+		t.Fatalf("pending reservations = %v, want none after settling", pending)
 	}
 }

@@ -14,13 +14,16 @@ data:
       "breaker_open_seconds": 30,
       "metrics_token_env": "AI_GATEWAY_METRICS_TOKEN",
       "clients": [
-        {"id":"demo-app","key_env":"AI_GATEWAY_CLIENT_KEY","allowed_models":["fast"],"rpm":60}
+        {"id":"demo-app","key_env":"AI_GATEWAY_CLIENT_KEY","allowed_models":["fast"],"rpm":60,"tpm":200000,"budget_micros":50000000}
       ],
       "providers": [
-        {"name":"openai-primary","base_url":"https://api.openai.com/v1","model":"gpt-4.1-mini","api_key_env":"OPENAI_API_KEY"}
+        {"name":"openai-primary","base_url":"https://api.openai.com/v1","model":"gpt-4.1-mini","api_key_env":"OPENAI_API_KEY","budget_micros":500000000}
       ],
       "models": [
         {"name":"fast","deployments":["openai-primary"]}
+      ],
+      "prices": [
+        {"model":"gpt-4.1-mini","provider":"openai-primary","currency":"USD","unit":"1m_tokens","version":"2026-01","input_rate":400000,"output_rate":1600000,"request_rate":0,"effective_at":"2026-01-01T00:00:00Z"}
       ]
     }
   policy.json: |
@@ -43,11 +46,18 @@ data:
         "tenant_key": "client_id",
         "budget_window": "calendar_month",
         "currency": "USD",
-        "store": {"mode": "shared", "on_unavailable": "degrade", "degrade_factor": 0.5, "reservation_ttl": "10m"},
+        "store": {
+          "mode": "shared",
+          "on_unavailable": "degrade",
+          "degrade_factor": 0.5,
+          "reservation_ttl": "10m",
+          "sweep_interval": "1m",
+          "redis": {"addr": "ai-gateway-redis:6379", "password_env": "", "db": 0, "pool_size": 8, "dial_timeout": "2s", "read_timeout": "2s", "write_timeout": "2s", "key_prefix": "ai-gateway"}
+        },
         "stream_reserve_tokens": 4096,
         "stream_overage": "abort"
       },
-      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both"},
+      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both", "audit_file_path": "/var/log/ai-gateway/audit.jsonl"},
       "streaming": {"max_event_bytes": 262144, "max_stream_bytes": 16777216, "require_usage_in_stream": true, "abort_on_client_gone": true},
       "drain": {"timeout": "30s", "readiness_fails_on_drain": true, "liveness_depends_on_upstream": false},
       "observability": {"max_label_cardinality": 200, "allowed_labels": ["tenant", "client", "model", "provider", "route", "status_class", "outcome", "error_code"]},
