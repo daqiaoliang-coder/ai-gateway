@@ -157,6 +157,7 @@ components:
                 - rate_limit_exceeded
                 - token_rate_limit_exceeded
                 - budget_exceeded
+                - quota_unavailable
                 - gateway_overloaded
                 - upstream_unavailable
                 - upstream_rate_limited

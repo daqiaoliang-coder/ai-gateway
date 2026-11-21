@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -181,6 +182,14 @@ func New(cfg config.File, opts Options) (*Gateway, error) {
 		parsed, err := url.Parse(item.BaseURL)
 		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return nil, fmt.Errorf("provider %q has invalid base_url", item.Name)
+		}
+		// Egress controls: never send a bearer token over plaintext, and never
+		// talk to a host that was not declared in the contract.
+		if contract.HTTPSRequired() && parsed.Scheme != "https" {
+			return nil, fmt.Errorf("provider %q base_url %q is not https; egress.require_https forbids plaintext upstreams", item.Name, item.BaseURL)
+		}
+		if len(contract.Egress.AllowedHosts) > 0 && !slices.Contains(contract.Egress.AllowedHosts, parsed.Hostname()) {
+			return nil, fmt.Errorf("provider %q base_url host %q is not in egress.allowed_hosts", item.Name, parsed.Hostname())
 		}
 		apiKey := ""
 		if item.APIKeyEnv != "" {
@@ -509,7 +518,7 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// a retry cannot consume the tenant's budget twice.
 	reserved := g.reserve(ctx, caller, selectedModel, route, requestID(ctx), body, request.Stream)
 	if !reserved.decision.Allowed {
-		status = http.StatusTooManyRequests
+		status = reserved.status
 		setRetryAfter(w, time.Second)
 		writeError(w, status, reserved.code, reserved.message, requestID(ctx))
 		completion = policy.StreamAbortedGateway
@@ -524,7 +533,7 @@ func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	completion = result.completion
 	outcome = result.outcome
 	attempts = result.attempts
-	g.account(ctx, reserved, result, caller, selectedModel, selectedProvider, inputTokens, outputTokens)
+	g.account(ctx, reserved, result, caller, selectedModel)
 }
 
 // reservation captures what a request held so it can be settled afterwards.
@@ -533,6 +542,7 @@ type reservation struct {
 	decision quota.Decision
 	code     string
 	message  string
+	status   int
 	active   bool
 }
 
@@ -552,64 +562,64 @@ func estimateTokens(body []byte, stream bool, reserveOutput int64) (input, outpu
 }
 
 func (g *Gateway) reserve(ctx context.Context, caller *client, model string, route *modelRoute, id string, body []byte, stream bool) reservation {
-	if g.quota == nil {
-		// No store means no enforcement. Tests and single-purpose deployments
-		// rely on this, but it must never be the production default.
-		return reservation{decision: quota.Decision{Allowed: true, Reason: "quota_disabled"}}
-	}
-	result := reservation{}
 	window := caller.budgetWindow
 	if window == "" {
 		window = g.contract.Quota.BudgetWindow
 	}
-	primary := ""
-	if len(route.deployments) > 0 {
-		primary = route.deployments[0].name
-	}
 	inputTokens, outputTokens := estimateTokens(body, stream, g.contract.Quota.StreamReserveTokens)
-
 	micros := int64(0)
-	if price, found := g.prices.Lookup(primary, route.deployments[0].model); found && len(route.deployments) > 0 {
-		micros = int64(price.Cost(false, inputTokens) + price.Cost(true, outputTokens) + price.RequestRate)
+	for _, target := range route.deployments {
+		price, found := g.prices.Lookup(target.name, target.model)
+		if !found && caller.budgetMicros > 0 {
+			return reservation{status: http.StatusServiceUnavailable, code: policy.CodeQuotaUnavailable, message: "budget enforcement requires a model price"}
+		}
+		amount := int64(price.Cost(false, inputTokens) + price.Cost(true, outputTokens) + price.RequestRate)
+		micros = max(micros, amount)
 	}
-
+	tokens := inputTokens + outputTokens
+	if g.contract.ReplaysUnknownOutcome() {
+		micros *= int64(g.contract.Retry.MaxAttempts)
+		tokens *= int64(g.contract.Retry.MaxAttempts)
+	}
 	plan, err := quota.BuildPlan(quota.Config{
-		Tenant:             caller.id,
-		Model:              model,
-		Provider:           primary,
-		TenantRPM:          caller.rpm,
-		TenantTPM:          caller.tpm,
-		TenantBudgetMicros: caller.budgetMicros,
-		Window:             window,
-	}, id, inputTokens+outputTokens, micros, g.reserveTTL, time.Now())
+		Tenant: caller.id, Model: model, TenantRPM: caller.rpm, TenantTPM: caller.tpm,
+		TenantBudgetMicros: caller.budgetMicros, Window: window,
+	}, id, tokens, micros, g.reserveTTL, time.Now())
 	if err != nil {
 		g.logger.Error("quota plan could not be built", "request_id", id, "error", err)
-		result.decision = quota.Decision{Allowed: true, Reason: "plan_error"}
+		return reservation{status: http.StatusInternalServerError, code: policy.CodeInternalError, message: "could not construct quota reservation"}
+	}
+	return g.reservePlan(ctx, plan)
+}
+
+func (g *Gateway) reservePlan(ctx context.Context, plan quota.Plan) reservation {
+	result := reservation{plan: plan, status: http.StatusTooManyRequests}
+	if g.quota == nil || len(plan.Lines) == 0 {
+		result.decision = quota.Decision{Allowed: true, Reason: "no_limits_configured"}
 		return result
 	}
-
 	decision, err := g.quota.Reserve(ctx, plan)
 	if err != nil {
-		// A store failure must not take the gateway down; the manager already
-		// applied the configured degradation, and anything left over is logged.
-		g.logger.Error("quota reserve failed", "request_id", id, "error", err)
-		result.decision = quota.Decision{Allowed: true, Reason: "reserve_error"}
+		g.logger.Error("quota reserve failed", "request_id", requestID(ctx), "reservation_id", plan.ID, "error", err)
+		result.status, result.code, result.message = http.StatusServiceUnavailable, policy.CodeQuotaUnavailable, "quota storage is unavailable"
 		return result
 	}
-	result.plan = plan
 	result.decision = decision
-	result.active = decision.Allowed
+	result.active = decision.Allowed && !decision.Untracked
 	if decision.Allowed {
 		return result
 	}
-
-	switch decision.DeniedKind {
-	case quota.KindTokens:
-		result.code, result.message = policy.CodeTokenRateLimit, "client token rate limit exceeded"
-	case quota.KindBudget:
-		result.code, result.message = policy.CodeBudgetExceeded, "client budget exhausted for the current window"
-	default:
-		result.code, result.message = policy.CodeRateLimitExceeded, "client request rate limit exceeded"
+	if decision.Degraded {
+		result.status, result.code, result.message = http.StatusServiceUnavailable, policy.CodeQuotaUnavailable, "quota storage is unavailable"
+	} else {
+		switch decision.DeniedKind {
+		case quota.KindTokens:
+			result.code, result.message = policy.CodeTokenRateLimit, "token rate limit exceeded"
+		case quota.KindBudget:
+			result.code, result.message = policy.CodeBudgetExceeded, "budget exhausted for the current window"
+		default:
+			result.code, result.message = policy.CodeRateLimitExceeded, "request rate limit exceeded"
+		}
 	}
 	g.emitQuota(ctx, plan, decision)
 	return result
@@ -617,81 +627,69 @@ func (g *Gateway) reserve(ctx context.Context, caller *client, model string, rou
 
 // account settles the reservation with real usage and emits the usage event that
 // makes cost reconcilable by tenant, model and provider.
-func (g *Gateway) account(ctx context.Context, reserved reservation, result forwardResult, caller *client, model, provider string, inputTokens, outputTokens int64) {
-	settlement := g.settle(ctx, reserved, result.provider, model, provider, inputTokens, outputTokens)
-	if g.recorder == nil || !reserved.active {
-		return
+func (g *Gateway) account(ctx context.Context, reserved reservation, result forwardResult, caller *client, model string) {
+	var tokens, micros int64
+	for _, charge := range result.charges {
+		tokens += charge.usage.InputTokens + charge.usage.OutputTokens
+		micros += int64(charge.line.Total)
+		if g.recorder == nil {
+			continue
+		}
+		g.recorder.Usage(audit.UsageEvent{
+			Timestamp: time.Now().UTC(), RequestID: requestID(ctx), AttemptID: charge.id,
+			Tenant: caller.id, Client: caller.id, Model: model, UpstreamModel: charge.model,
+			Provider: charge.provider, Status: charge.httpStatus, DurationMS: charge.durationMS,
+			InputTokens: charge.usage.InputTokens, OutputTokens: charge.usage.OutputTokens,
+			UsageReported: charge.usage.Reported, Reconciliation: string(charge.status),
+			StreamComplete: string(charge.completion), Currency: charge.line.Currency,
+			PriceVersion: charge.line.Version, PriceFound: charge.found,
+			TotalMicros: int64(charge.line.Total), InputCostMicros: int64(charge.line.InputCost),
+			OutputCostMicro: int64(charge.line.OutputCost),
+		})
 	}
-	g.recorder.Usage(audit.UsageEvent{
-		Timestamp:       time.Now().UTC(),
-		RequestID:       requestID(ctx),
-		AttemptID:       reserved.plan.ID,
-		Tenant:          caller.id,
-		Client:          caller.id,
-		Model:           model,
-		UpstreamModel:   model,
-		Provider:        settlement.provider,
-		Status:          result.status,
-		DurationMS:      0,
-		InputTokens:     settlement.usage.InputTokens,
-		OutputTokens:    settlement.usage.OutputTokens,
-		UsageReported:   settlement.usage.Reported,
-		Reconciliation:  string(settlement.status),
-		StreamComplete:  string(result.completion),
-		Currency:        settlement.line.Currency,
-		PriceVersion:    settlement.line.Version,
-		PriceFound:      settlement.found,
-		TotalMicros:     int64(settlement.line.Total),
-		InputCostMicros: int64(settlement.line.InputCost),
-		OutputCostMicro: int64(settlement.line.OutputCost),
-	})
+	g.settleReservation(ctx, reserved, tokens, micros)
 }
 
 type settlementResult struct {
-	line     cost.Line
-	usage    cost.Usage
-	status   cost.Status
-	found    bool
-	provider string
+	line       cost.Line
+	usage      cost.Usage
+	status     cost.Status
+	found      bool
+	provider   string
+	model      string
+	id         string
+	httpStatus int
+	durationMS int64
+	completion policy.StreamCompletion
 }
 
-// settle converts held budget into real spend, or returns it when nothing was
-// generated.
-func (g *Gateway) settle(ctx context.Context, reserved reservation, provider, model, alias string, inputTokens, outputTokens int64) settlementResult {
-	complete := reserved.decision.Allowed
-	usage := cost.Usage{InputTokens: inputTokens, OutputTokens: outputTokens, Reported: inputTokens > 0 || outputTokens > 0}
-	settled := settlementResult{usage: usage, provider: provider, status: cost.StatusOK}
-
-	if g.prices != nil && provider != "" {
-		upstreamModel := model
-		if g.prices != nil {
-			if target, ok := g.providerByName(provider); ok {
-				upstreamModel = target.model
-			}
-		}
-		policy_ := cost.Estimate
-		switch g.contract.Usage.MissingUsagePolicy {
-		case "reject":
-			policy_ = cost.Reject
-		case "allow_zero":
-			policy_ = cost.AllowZero
-		}
-		line, err := g.prices.Settle(provider, upstreamModel, usage, complete, policy_, cost.CharEstimator{CharsPerToken: 4}, inputTokens*4, outputTokens*4)
-		if err != nil {
-			g.logger.Warn("usage could not be settled", "request_id", requestID(ctx), "error", err)
-		}
-		settled.line = line.Line
-		settled.usage = line.Usage
-		settled.status = line.Status
-		settled.found = line.PriceFound
-		settled.provider = provider
-	}
-	if !complete {
-		settled.status = cost.StatusPartial
-	}
-
-	if g.quota == nil {
+func (g *Gateway) priceAttempt(ctx context.Context, target *provider, res attemptResult, body []byte, stream bool) settlementResult {
+	usage := cost.Usage{InputTokens: res.input, OutputTokens: res.output, Reported: res.usageReported}
+	settled := settlementResult{usage: usage, provider: target.name, model: target.model, status: cost.StatusOK}
+	switch res.outcome {
+	case policy.OutcomeNotSent, policy.OutcomeThrottled, policy.OutcomeRejected, policy.OutcomeNotAttempted:
+		settled.usage = cost.Usage{Reported: true}
 		return settled
+	}
+	input, output := estimateTokens(body, stream, g.contract.Quota.StreamReserveTokens)
+	missingPolicy := cost.Estimate
+	if g.contract.Usage.MissingUsagePolicy == "allow_zero" {
+		missingPolicy = cost.AllowZero
+	}
+	complete := res.outcome == policy.OutcomeProcessed && res.completion.CountsAsSuccess()
+	line, _ := g.prices.Settle(target.name, target.model, usage, complete, missingPolicy, cost.CharEstimator{CharsPerToken: 4}, input*4, output*4)
+	settled.line, settled.usage, settled.status, settled.found = line.Line, line.Usage, line.Status, line.PriceFound
+	if !usage.Reported && g.contract.Usage.MissingUsagePolicy == "reject" {
+		// Generation cannot be undone; retain an estimate instead of releasing spent budget.
+		settled.status = cost.StatusMissing
+		g.logger.Warn("usage missing; reserved estimate requires reconciliation", "request_id", requestID(ctx), "provider", target.name)
+	}
+	return settled
+}
+
+func (g *Gateway) settleReservation(ctx context.Context, reserved reservation, tokens, micros int64) {
+	if !reserved.active || g.quota == nil {
+		return
 	}
 	actuals := make([]int64, len(reserved.plan.Lines))
 	for i, line := range reserved.plan.Lines {
@@ -699,55 +697,38 @@ func (g *Gateway) settle(ctx context.Context, reserved reservation, provider, mo
 		case quota.KindRequests:
 			actuals[i] = 1
 		case quota.KindTokens:
-			actuals[i] = settled.usage.InputTokens + settled.usage.OutputTokens
+			actuals[i] = tokens
 		case quota.KindBudget:
-			actuals[i] = int64(settled.line.Total)
+			actuals[i] = micros
 		}
 	}
-	if err := g.quota.Settle(ctx, quota.Settlement{ID: reserved.plan.ID, Actuals: actuals}); err != nil {
-		if !errors.Is(err, quota.ErrUnknownReservation) {
-			g.logger.Error("quota settle failed", "request_id", requestID(ctx), "error", err)
-		}
+	// Client cancellation must not cancel accounting for an already billed generation.
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := g.quota.Settle(settleCtx, quota.Settlement{ID: reserved.plan.ID, Actuals: actuals}); err != nil {
+		g.logger.Error("quota settle failed; reconciliation required", "request_id", requestID(ctx), "reservation_id", reserved.plan.ID, "actuals", actuals, "error", err)
 	}
-	g.chargeProviderBudget(ctx, provider, int64(settled.line.Total), reserved.plan.ID)
-	return settled
 }
 
-// chargeProviderBudget books platform-wide provider spend after the fact. It
-// cannot be part of the pre-flight plan because which provider answers is known
-// only once the request completed.
-func (g *Gateway) chargeProviderBudget(ctx context.Context, providerName string, micros int64, attemptID string) {
-	if g.quota == nil || micros <= 0 {
-		return
+func (g *Gateway) reserveProviderBudget(ctx context.Context, target *provider, id string, body []byte, stream bool) reservation {
+	if target.budgetMicros <= 0 || g.quota == nil {
+		return reservation{decision: quota.Decision{Allowed: true}}
 	}
-	target, ok := g.providerByName(providerName)
-	if !ok || target.budgetMicros <= 0 {
-		return
+	price, found := g.prices.Lookup(target.name, target.model)
+	if !found {
+		return reservation{status: http.StatusServiceUnavailable, code: policy.CodeQuotaUnavailable, message: "provider budget enforcement requires a model price"}
 	}
+	input, output := estimateTokens(body, stream, g.contract.Quota.StreamReserveTokens)
+	micros := int64(price.Cost(false, input) + price.Cost(true, output) + price.RequestRate)
 	plan, err := quota.BuildPlan(quota.Config{
-		Provider:             target.name,
-		Model:                target.model,
-		Window:               g.contract.Quota.BudgetWindow,
+		Provider: target.name, Model: target.model, Window: g.contract.Quota.BudgetWindow,
 		ProviderBudgetMicros: target.budgetMicros,
-	}, attemptID+":provider:"+target.name, 0, micros, g.reserveTTL, time.Now())
+	}, id, 0, micros, g.reserveTTL, time.Now())
 	if err != nil {
-		g.logger.Error("provider budget plan failed", "provider", providerName, "error", err)
-		return
+		g.logger.Error("provider budget plan failed", "provider", target.name, "error", err)
+		return reservation{status: http.StatusInternalServerError, code: policy.CodeInternalError, message: "could not construct provider quota reservation"}
 	}
-	decision, err := g.quota.Reserve(ctx, plan)
-	if err != nil {
-		g.logger.Error("provider budget reserve failed", "provider", providerName, "error", err)
-		return
-	}
-	if !decision.Allowed {
-		g.logger.Warn("provider budget exhausted",
-			"provider", providerName, "window", decision.DeniedKey, "remaining", decision.Remaining)
-		g.emitQuota(ctx, plan, decision)
-		return
-	}
-	if err := g.quota.Settle(ctx, quota.Settlement{ID: plan.ID, Actuals: []int64{micros}}); err != nil {
-		g.logger.Error("provider budget settle failed", "provider", providerName, "error", err)
-	}
+	return g.reservePlan(ctx, plan)
 }
 
 func (g *Gateway) emitQuota(ctx context.Context, plan quota.Plan, decision quota.Decision) {
@@ -767,15 +748,6 @@ func (g *Gateway) emitQuota(ctx context.Context, plan quota.Plan, decision quota
 		Reason:    decision.Reason,
 		Degraded:  decision.Degraded,
 	})
-}
-
-func (g *Gateway) providerByName(name string) (*provider, bool) {
-	for _, target := range g.providerList {
-		if target.name == name {
-			return target, true
-		}
-	}
-	return nil, false
 }
 
 func (g *Gateway) authenticate(w http.ResponseWriter, r *http.Request) (*client, bool) {
@@ -803,24 +775,28 @@ type forwardResult struct {
 	completion policy.StreamCompletion
 	outcome    policy.Outcome
 	attempts   int
+	charges    []settlementResult
 }
 
 // attemptResult describes a single upstream attempt.
 type attemptResult struct {
-	outcome    policy.Outcome
-	status     int
-	provider   string
-	input      int64
-	output     int64
-	completion policy.StreamCompletion
-	retryAfter time.Duration
-	fail       copyFailure
-	errorBody  []byte
-	responded  bool
-	err        error
+	outcome       policy.Outcome
+	status        int
+	provider      string
+	input         int64
+	output        int64
+	completion    policy.StreamCompletion
+	retryAfter    time.Duration
+	fail          copyFailure
+	errorBody     []byte
+	responded     bool
+	usageReported bool
+	err           error
 }
 
-func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, route *modelRoute, body []byte, stream bool) forwardResult {
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, route *modelRoute, body []byte, stream bool) (result forwardResult) {
+	var charges []settlementResult
+	defer func() { result.charges = charges }()
 	ctx := r.Context()
 	id := requestID(ctx)
 	order := route.ordered()
@@ -833,18 +809,27 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, route *modelRo
 	idx := 0
 	attempts := 0
 	last := attemptResult{outcome: policy.OutcomeUnknown}
+	var denied *reservation
 
 	for idx < len(order) && attempts < pol.Retry.MaxAttempts {
 		target := order[idx]
-		if !target.breaker.allow() {
-			g.metrics.breakerSkips.Add(1)
-			idx++
-			continue
-		}
 		if !hasDeadlineBudget(ctx, g.minAttemptBudget) {
 			g.logger.Warn("retry skipped: total deadline exhausted",
 				"request_id", id, "model", route.name, "attempts", attempts)
 			break
+		}
+		attemptID := fmt.Sprintf("%s:%d:%s", id, attempts+1, target.name)
+		providerHold := g.reserveProviderBudget(ctx, target, attemptID, body, stream)
+		if !providerHold.decision.Allowed {
+			denied = &providerHold
+			idx++
+			continue
+		}
+		if !target.breaker.allow() {
+			g.settleReservation(ctx, providerHold, 0, 0)
+			g.metrics.breakerSkips.Add(1)
+			idx++
+			continue
 		}
 		attempts++
 		g.metrics.upstreamAttempts.Add(1)
@@ -852,7 +837,13 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, route *modelRo
 			g.metrics.retries.Add(1)
 		}
 
+		started := time.Now()
 		res := g.attemptOnce(w, ctx, target, body, stream)
+		charge := g.priceAttempt(ctx, target, res, body, stream)
+		charge.id, charge.httpStatus, charge.completion = attemptID, res.status, res.completion
+		charge.durationMS = time.Since(started).Milliseconds()
+		charges = append(charges, charge)
+		g.settleReservation(ctx, providerHold, charge.usage.InputTokens+charge.usage.OutputTokens, int64(charge.line.Total))
 		last = res
 
 		if res.outcome == policy.OutcomeProcessed && res.err == nil {
@@ -914,6 +905,11 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, route *modelRo
 			attempts:   attempts,
 		}
 	}
+	if attempts == 0 && denied != nil {
+		setRetryAfter(w, time.Second)
+		writeError(w, denied.status, denied.code, denied.message, id)
+		return forwardResult{status: denied.status, completion: policy.StreamAbortedGateway, outcome: policy.OutcomeNotAttempted}
+	}
 	return g.writeFailureResponse(w, ctx, route, last, attempts)
 }
 
@@ -974,15 +970,16 @@ func (g *Gateway) attemptOnce(w http.ResponseWriter, ctx context.Context, target
 			w.WriteHeader(response.StatusCode)
 			res := g.copyStream(w, attemptCtx, response.Body)
 			return attemptResult{
-				outcome:    policy.Classify(policy.PhaseBodyForwarding, response.StatusCode, res.err),
-				status:     response.StatusCode,
-				provider:   target.name,
-				input:      res.input,
-				output:     res.output,
-				completion: res.completion,
-				fail:       res.fail,
-				responded:  true,
-				err:        res.err,
+				outcome:       policy.Classify(policy.PhaseBodyForwarding, response.StatusCode, res.err),
+				status:        response.StatusCode,
+				provider:      target.name,
+				input:         res.input,
+				output:        res.output,
+				usageReported: res.usageReported,
+				completion:    res.completion,
+				fail:          res.fail,
+				responded:     true,
+				err:           res.err,
 			}
 		}
 		payload, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
@@ -1004,31 +1001,33 @@ func (g *Gateway) attemptOnce(w http.ResponseWriter, ctx context.Context, target
 				err:      errors.New("upstream response exceeds the configured limit"),
 			}
 		}
-		input, output := extractUsage(payload)
+		input, output, usageReported := extractUsage(payload)
 		copyHeader(w.Header(), response.Header)
 		w.Header().Set("X-Request-ID", id)
 		w.WriteHeader(response.StatusCode)
 		if _, writeErr := w.Write(payload); writeErr != nil {
 			return attemptResult{
-				outcome:    policy.OutcomeProcessed,
-				status:     response.StatusCode,
-				provider:   target.name,
-				input:      input,
-				output:     output,
-				completion: policy.StreamCompleted,
-				fail:       failClient,
-				responded:  true,
-				err:        writeErr,
+				outcome:       policy.OutcomeProcessed,
+				status:        response.StatusCode,
+				provider:      target.name,
+				input:         input,
+				output:        output,
+				usageReported: usageReported,
+				completion:    policy.StreamCompleted,
+				fail:          failClient,
+				responded:     true,
+				err:           writeErr,
 			}
 		}
 		return attemptResult{
-			outcome:    policy.OutcomeProcessed,
-			status:     response.StatusCode,
-			provider:   target.name,
-			input:      input,
-			output:     output,
-			completion: policy.StreamCompleted,
-			responded:  true,
+			outcome:       policy.OutcomeProcessed,
+			status:        response.StatusCode,
+			provider:      target.name,
+			input:         input,
+			output:        output,
+			usageReported: usageReported,
+			completion:    policy.StreamCompleted,
+			responded:     true,
 		}
 	}
 
@@ -1201,13 +1200,16 @@ func rewriteModel(body []byte, model string, includeStreamUsage bool) ([]byte, e
 	}
 	payload["model"] = value
 	if includeStreamUsage {
-		options := map[string]any{}
+		var options map[string]any
 		if existing, ok := payload["stream_options"]; ok && len(existing) > 0 {
-			_ = json.Unmarshal(existing, &options)
+			if err := json.Unmarshal(existing, &options); err != nil {
+				return nil, fmt.Errorf("stream_options must be an object: %w", err)
+			}
 		}
-		if _, ok := options["include_usage"]; !ok {
-			options["include_usage"] = true
+		if options == nil {
+			options = make(map[string]any)
 		}
+		options["include_usage"] = true
 		merged, err := json.Marshal(options)
 		if err != nil {
 			return nil, err
@@ -1225,17 +1227,21 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-func extractUsage(body []byte) (int64, int64) {
+func extractUsage(body []byte) (int64, int64, bool) {
 	var envelope struct {
-		Usage struct {
-			PromptTokens     int64 `json:"prompt_tokens"`
-			CompletionTokens int64 `json:"completion_tokens"`
+		Usage *struct {
+			PromptTokens     *int64 `json:"prompt_tokens"`
+			CompletionTokens *int64 `json:"completion_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal(body, &envelope) != nil {
-		return 0, 0
+	if json.Unmarshal(body, &envelope) != nil || envelope.Usage == nil || envelope.Usage.PromptTokens == nil || envelope.Usage.CompletionTokens == nil {
+		return 0, 0, false
 	}
-	return envelope.Usage.PromptTokens, envelope.Usage.CompletionTokens
+	input, output := *envelope.Usage.PromptTokens, *envelope.Usage.CompletionTokens
+	if input < 0 || output < 0 {
+		return 0, 0, false
+	}
+	return input, output, true
 }
 
 func parseRetryAfter(raw string) time.Duration {

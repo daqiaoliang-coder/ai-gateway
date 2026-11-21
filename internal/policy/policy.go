@@ -30,6 +30,7 @@ type Contract struct {
 	Streaming     Streaming      `json:"streaming"`
 	Drain         Drain          `json:"drain"`
 	Observability Observability  `json:"observability"`
+	Egress        Egress         `json:"egress"`
 	ErrorCodes    ErrorCodeRules `json:"error_codes"`
 }
 
@@ -132,6 +133,26 @@ type Drain struct {
 type Observability struct {
 	MaxLabelCardinality int      `json:"max_label_cardinality"`
 	AllowedLabels       []string `json:"allowed_labels"`
+}
+
+// Egress constrains where the gateway may send traffic. It is the machine-
+// checkable half of the "no plaintext upstream, no undeclared egress" rule; the
+// matching NetworkPolicy lives in the deployment manifests.
+type Egress struct {
+	// RequireHTTPS rejects any provider base URL that is not https. Plaintext
+	// HTTP to an inference provider would expose bearer tokens and traffic. Nil
+	// means the production default (true); an explicit false is honored so local
+	// development against plaintext mocks stays possible.
+	RequireHTTPS *bool `json:"require_https,omitempty"`
+	// AllowedHosts restricts outbound connections to these hosts. Empty means
+	// "any host is allowed" and only has an effect when populated. Redis and
+	// every provider host must be listed.
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+}
+
+// HTTPSRequired reports whether plaintext provider URLs are forbidden.
+func (c *Contract) HTTPSRequired() bool {
+	return c.Egress.RequireHTTPS == nil || *c.Egress.RequireHTTPS
 }
 
 // ErrorCodeRules defines the single error envelope returned to clients.
@@ -279,6 +300,10 @@ func (c *Contract) defaults() {
 	}
 	if !c.Drain.ReadinessFailsOnDrain {
 		c.Drain.ReadinessFailsOnDrain = true
+	}
+	if c.Egress.RequireHTTPS == nil {
+		https := true
+		c.Egress.RequireHTTPS = &https
 	}
 	if c.Observability.MaxLabelCardinality == 0 {
 		c.Observability.MaxLabelCardinality = 200
@@ -493,6 +518,16 @@ func (c *Contract) Validate() error {
 			return fmt.Errorf("error_codes.passthrough_statuses must only contain 4xx/5xx codes, got %d", status)
 		}
 	}
+	seenHost := make(map[string]bool, len(c.Egress.AllowedHosts))
+	for _, host := range c.Egress.AllowedHosts {
+		if host == "" || strings.ContainsAny(host, "/:") {
+			return fmt.Errorf("egress.allowed_hosts entries must be bare hostnames without scheme or port, got %q", host)
+		}
+		if seenHost[host] {
+			return fmt.Errorf("egress.allowed_hosts contains duplicate %q", host)
+		}
+		seenHost[host] = true
+	}
 	return nil
 }
 
@@ -684,6 +719,7 @@ const (
 	CodeRateLimitExceeded   = "rate_limit_exceeded"
 	CodeTokenRateLimit      = "token_rate_limit_exceeded"
 	CodeBudgetExceeded      = "budget_exceeded"
+	CodeQuotaUnavailable    = "quota_unavailable"
 	CodeGatewayOverloaded   = "gateway_overloaded"
 	CodeUpstreamUnavailable = "upstream_unavailable"
 	CodeUpstreamRateLimited = "upstream_rate_limited"
@@ -705,6 +741,7 @@ var GatewayErrorCodes = []string{
 	CodeRateLimitExceeded,
 	CodeTokenRateLimit,
 	CodeBudgetExceeded,
+	CodeQuotaUnavailable,
 	CodeGatewayOverloaded,
 	CodeUpstreamUnavailable,
 	CodeUpstreamRateLimited,

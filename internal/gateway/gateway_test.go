@@ -16,12 +16,51 @@ import (
 	"time"
 
 	"github.com/daqiaoliang-coder/ai-gateway/internal/audit"
+	"github.com/daqiaoliang-coder/ai-gateway/internal/config"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/cost"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/policy"
 	"github.com/daqiaoliang-coder/ai-gateway/internal/quota"
 )
 
 const testKey = "test-client-key"
+
+func TestNewEnforcesProviderEgress(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		baseURL   string
+		allowHTTP bool
+		hosts     []string
+		wantError bool
+	}{
+		{name: "https", baseURL: "https://provider.example/v1"},
+		{name: "plaintext rejected", baseURL: "http://provider.example/v1", wantError: true},
+		{name: "local plaintext opt in", baseURL: "http://localhost:8081/v1", allowHTTP: true},
+		{name: "host with port", baseURL: "https://provider.example:8443/v1", hosts: []string{"provider.example"}},
+		{name: "undeclared host", baseURL: "https://other.example/v1", hosts: []string{"provider.example"}, wantError: true},
+		{name: "suffix is not allowed", baseURL: "https://provider.example.other/v1", hosts: []string{"provider.example"}, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("TEST_GATEWAY_CLIENT_KEY", testKey)
+			contract := policy.Default()
+			if tt.allowHTTP {
+				required := false
+				contract.Egress.RequireHTTPS = &required
+			}
+			contract.Egress.AllowedHosts = tt.hosts
+			cfg := config.File{
+				RequestTimeout: "30s", MaxRequestBytes: 1024, MaxConcurrentRequests: 1,
+				BreakerFailures: 3, BreakerOpenSeconds: 1,
+				Clients:   []config.Client{{ID: "test", KeyEnv: "TEST_GATEWAY_CLIENT_KEY", AllowedModels: []string{"fast"}}},
+				Providers: []config.Provider{{Name: "primary", BaseURL: tt.baseURL, Model: "upstream-model"}},
+				Models:    []config.Model{{Name: "fast", Deployments: []string{"primary"}}},
+			}
+			_, err := New(cfg, Options{Contract: contract, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			if (err != nil) != tt.wantError {
+				t.Fatalf("New error = %v, want error %v", err, tt.wantError)
+			}
+		})
+	}
+}
 
 // testUpstream is a provider simulator that counts how many requests it served.
 type testUpstream struct {
@@ -571,6 +610,34 @@ func TestStreamUsageIsRequested(t *testing.T) {
 	}
 }
 
+func TestRequiredStreamUsageCannotBeDisabled(t *testing.T) {
+	for _, options := range []string{`null`, `{}`, `{"include_usage":false}`, `{"include_usage":true}`} {
+		t.Run(options, func(t *testing.T) {
+			body := []byte(`{"model":"fast","stream":true,"stream_options":` + options + `}`)
+			rewritten, err := rewriteModel(body, "upstream-model", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				StreamOptions struct {
+					IncludeUsage bool `json:"include_usage"`
+				} `json:"stream_options"`
+			}
+			if err := json.Unmarshal(rewritten, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if !payload.StreamOptions.IncludeUsage {
+				t.Fatal("usage reporting was disabled")
+			}
+		})
+	}
+	for _, options := range []string{`false`, `[]`, `"invalid"`} {
+		if _, err := rewriteModel([]byte(`{"stream_options":`+options+`}`), "upstream-model", true); err == nil {
+			t.Fatalf("invalid stream_options accepted: %s", options)
+		}
+	}
+}
+
 func TestStreamUsageNotInjectedForNonStreamRequests(t *testing.T) {
 	primary := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -717,6 +784,9 @@ func (c *countingStore) Abandon(ctx context.Context, id string) error {
 }
 func (c *countingStore) Sweep(ctx context.Context, keys []string, now time.Time) (int, error) {
 	return c.inner.Sweep(ctx, keys, now)
+}
+func (c *countingStore) HasReservation(ctx context.Context, id string) (bool, error) {
+	return c.inner.HasReservation(ctx, id)
 }
 func (c *countingStore) Close() error { return nil }
 
@@ -914,8 +984,272 @@ func TestUsageEventIsTraceableByTenantModelAndProvider(t *testing.T) {
 	}
 }
 
-// A request that fails with an uncertain outcome is charged exactly once, which
-// is what stage 1's no-replay rule means in money terms.
+func TestProviderBudgetIsCheckedBeforeSending(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	upstream := newUpstream(t, "primary", successUpstream(20))
+	g := newTestGateway(t, contract, upstream)
+	store := quota.NewMemoryStore()
+	enableQuota(t, g, store, nil, "primary")
+	g.providerList[0].budgetMicros = 300
+	if got := postChat(t, g, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("first request = %d: %s", got.Code, got.Body.String())
+	}
+	second := postChat(t, g, chatBody("fast", false))
+	if second.Code != http.StatusTooManyRequests || errorCode(t, second) != policy.CodeBudgetExceeded {
+		t.Fatalf("second request = %d: %s", second.Code, second.Body.String())
+	}
+	if upstream.calls.Load() != 1 {
+		t.Fatalf("exhausted provider called %d times", upstream.calls.Load())
+	}
+	if pending := store.PendingIDs(); len(pending) != 0 {
+		t.Fatalf("pending reservations = %v", pending)
+	}
+}
+
+func TestProviderBudgetExhaustionSkipsToAnotherDeployment(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	primary := newUpstream(t, "primary", successUpstream(20))
+	backup := newUpstream(t, "backup", successUpstream(20))
+	g := newTestGateway(t, contract, primary, backup)
+	store := quota.NewMemoryStore()
+	enableQuota(t, g, store, nil, "primary", "backup")
+	g.providerList[0].budgetMicros = 1
+	g.providerList[1].budgetMicros = 1000
+	setTenantQuota(g, 0, 1000, 1000)
+	if got := postChat(t, g, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("request = %d: %s", got.Code, got.Body.String())
+	}
+	if primary.calls.Load() != 0 || backup.calls.Load() != 1 {
+		t.Fatalf("provider calls = %d/%d", primary.calls.Load(), backup.calls.Load())
+	}
+	if pending := store.PendingIDs(); len(pending) != 0 {
+		t.Fatalf("pending reservations = %v", pending)
+	}
+}
+
+func TestMissingUsageIsNotConfusedWithReportedZero(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		body         string
+		stream       bool
+		policy       string
+		wantReported bool
+		wantCharged  bool
+		wantStatus   cost.Status
+	}{
+		{name: "missing", body: `{}`, wantCharged: true, wantStatus: cost.StatusEstimated},
+		{name: "null", body: `{"usage":null}`, wantCharged: true, wantStatus: cost.StatusEstimated},
+		{name: "negative", body: `{"usage":{"prompt_tokens":-1,"completion_tokens":20}}`, wantCharged: true, wantStatus: cost.StatusEstimated},
+		{name: "reported zero", body: `{"usage":{"prompt_tokens":0,"completion_tokens":0}}`, wantReported: true, wantStatus: cost.StatusOK},
+		{name: "reject retains estimate", body: `{}`, policy: "reject", wantCharged: true, wantStatus: cost.StatusMissing},
+		{name: "explicit zero policy", body: `{}`, policy: "allow_zero", wantStatus: cost.StatusMissing},
+		{name: "stream missing", body: "data: [DONE]\n\n", stream: true, wantCharged: true, wantStatus: cost.StatusEstimated},
+		{name: "stream reported zero", body: "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n", stream: true, wantReported: true, wantStatus: cost.StatusOK},
+		{name: "stream truncated", body: "data: {}\n\n", stream: true, wantCharged: true, wantStatus: cost.StatusEstimated},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			contract := policy.Default()
+			contract.Quota.StreamReserveTokens = 64
+			if tt.policy != "" {
+				contract.Usage.MissingUsagePolicy = tt.policy
+			}
+			upstream := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tt.body)
+			})
+			g := newTestGateway(t, contract, upstream)
+			store := quota.NewMemoryStore()
+			sink := &capturingSink{}
+			recorder := audit.NewRecorder([]audit.Sink{sink}, 16)
+			recorder.Start()
+			t.Cleanup(func() { _ = recorder.Stop() })
+			enableQuota(t, g, store, recorder, "primary")
+			setTenantQuota(g, 0, 0, 10000)
+			if got := postChat(t, g, chatBody("fast", tt.stream)); got.Code != http.StatusOK {
+				t.Fatalf("request = %d: %s", got.Code, got.Body.String())
+			}
+			_ = recorder.Stop()
+			events := sink.usageSnapshot()
+			if len(events) != 1 {
+				t.Fatalf("events = %d", len(events))
+			}
+			event := events[0]
+			if event.UsageReported != tt.wantReported || event.Reconciliation != string(tt.wantStatus) {
+				t.Fatalf("reported/status = %v/%s", event.UsageReported, event.Reconciliation)
+			}
+			if (event.TotalMicros > 0) != tt.wantCharged {
+				t.Fatalf("cost = %d", event.TotalMicros)
+			}
+			keys, _, _ := quota.KeyFor(quota.Config{Tenant: "test", TenantBudgetMicros: 10000, Window: quota.WindowCalendarMonth}, time.Now())
+			if got := store.Used(keys.TenantBudget); got != event.TotalMicros {
+				t.Fatalf("used = %d, event cost = %d", got, event.TotalMicros)
+			}
+		})
+	}
+}
+
+func TestUnknownOutcomeRetryAccountsForEveryAttempt(t *testing.T) {
+	contract := policy.Default()
+	contract.Retry.MaxAttempts = 2
+	contract.Retry.RetryOnUnknownOutcome = true
+	contract.Fallback.AllowCrossProviderOnUnknown = true
+	contract.Quota.StreamReserveTokens = 64
+	primary := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	backup := newUpstream(t, "backup", successUpstream(20))
+	g := newTestGateway(t, contract, primary, backup)
+	store := quota.NewMemoryStore()
+	sink := &capturingSink{}
+	recorder := audit.NewRecorder([]audit.Sink{sink}, 16)
+	recorder.Start()
+	t.Cleanup(func() { _ = recorder.Stop() })
+	enableQuota(t, g, store, recorder, "primary", "backup")
+	setTenantQuota(g, 0, 0, 10000)
+	for _, target := range g.providerList {
+		target.budgetMicros = 10000
+	}
+	if got := postChat(t, g, chatBody("fast", false)); got.Code != http.StatusOK {
+		t.Fatalf("request = %d: %s", got.Code, got.Body.String())
+	}
+	_ = recorder.Stop()
+	events := sink.usageSnapshot()
+	if len(events) != 2 {
+		t.Fatalf("events = %d", len(events))
+	}
+	if events[0].RequestID != events[1].RequestID || events[0].AttemptID == events[1].AttemptID {
+		t.Fatal("attempts must share a request ID but have distinct attempt IDs")
+	}
+	var total int64
+	for _, event := range events {
+		if event.TotalMicros <= 0 || event.UpstreamModel != "upstream-model" {
+			t.Fatalf("event = %+v", event)
+		}
+		keys, _, _ := quota.KeyFor(quota.Config{Provider: event.Provider, ProviderBudgetMicros: 10000, Window: quota.WindowCalendarMonth}, time.Now())
+		if got := store.Used(keys.ProviderBudget); got != event.TotalMicros {
+			t.Fatalf("provider used = %d, event = %d", got, event.TotalMicros)
+		}
+		total += event.TotalMicros
+	}
+	keys, _, _ := quota.KeyFor(quota.Config{Tenant: "test", TenantBudgetMicros: 10000, Window: quota.WindowCalendarMonth}, time.Now())
+	if got := store.Used(keys.TenantBudget); got != total {
+		t.Fatalf("tenant used = %d, total = %d", got, total)
+	}
+}
+
+type reserveErrorStore struct {
+	quota.Store
+	err error
+}
+
+func (s reserveErrorStore) Reserve(context.Context, quota.Plan) (quota.Decision, error) {
+	return quota.Decision{}, s.err
+}
+
+func TestQuotaFailureDoesNotFailOpenForBudgets(t *testing.T) {
+	for _, mode := range []string{"fail_closed", "degrade", "fail_open"} {
+		t.Run(mode, func(t *testing.T) {
+			contract := policy.Default()
+			contract.Quota.StreamReserveTokens = 64
+			upstream := newUpstream(t, "primary", successUpstream(20))
+			g := newTestGateway(t, contract, upstream)
+			failed := reserveErrorStore{Store: quota.NewMemoryStore(), err: quota.ErrUnavailable}
+			enableQuota(t, g, failed, nil, "primary")
+			g.quota = quota.NewManager(failed, quota.NewMemoryStore(), mode, 0.5, nil)
+			setTenantQuota(g, 0, 0, 10000)
+			got := postChat(t, g, chatBody("fast", false))
+			if got.Code != http.StatusServiceUnavailable || errorCode(t, got) != policy.CodeQuotaUnavailable {
+				t.Fatalf("response = %d: %s", got.Code, got.Body.String())
+			}
+			if upstream.calls.Load() != 0 {
+				t.Fatal("unavailable hard budget reached upstream")
+			}
+		})
+	}
+}
+
+func TestKnownRejectionDoesNotConsumeTokenOrMoneyBudget(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	upstream := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadRequest) })
+	g := newTestGateway(t, contract, upstream)
+	store := quota.NewMemoryStore()
+	enableQuota(t, g, store, nil, "primary")
+	setTenantQuota(g, 10, 1000, 1000)
+	g.providerList[0].budgetMicros = 1000
+	got := postChat(t, g, chatBody("fast", false))
+	if got.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", got.Code)
+	}
+	keys, _, _ := quota.KeyFor(quota.Config{Tenant: "test", Provider: "primary", TenantRPM: 10, TenantTPM: 1000, TenantBudgetMicros: 1000, ProviderBudgetMicros: 1000, Window: quota.WindowCalendarMonth}, time.Now())
+	for _, key := range []string{keys.TenantTPM, keys.TenantBudget, keys.ProviderBudget} {
+		if store.Used(key) != 0 || store.Held(key) != 0 {
+			t.Fatalf("rejected attempt charged or held %s", key)
+		}
+	}
+	if store.Used(keys.TenantRPM) != 1 {
+		t.Fatal("rejected request must still count towards RPM")
+	}
+}
+
+func TestTenantReservationCoversMostExpensiveCandidate(t *testing.T) {
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	primary := newUpstream(t, "primary", successUpstream(20))
+	backup := newUpstream(t, "backup", successUpstream(20))
+	g := newTestGateway(t, contract, primary, backup)
+	enableQuota(t, g, quota.NewMemoryStore(), nil, "primary", "backup")
+	g.prices, _ = cost.NewTable([]cost.Price{
+		{Provider: "primary", Model: "upstream-model", Currency: "USD", Unit: cost.UnitToken, Version: "v1", InputRate: 1, OutputRate: 1},
+		{Provider: "backup", Model: "upstream-model", Currency: "USD", Unit: cost.UnitToken, Version: "v1", InputRate: 1, OutputRate: 100},
+	})
+	setTenantQuota(g, 0, 0, 1000)
+	got := postChat(t, g, chatBody("fast", false))
+	if got.Code != http.StatusTooManyRequests || primary.calls.Load() != 0 || backup.calls.Load() != 0 {
+		t.Fatalf("status/calls = %d/%d/%d", got.Code, primary.calls.Load(), backup.calls.Load())
+	}
+}
+
+type cancellationCheckingStore struct {
+	quota.Store
+	canceled    atomic.Bool
+	settlements atomic.Int64
+}
+
+func (s *cancellationCheckingStore) Settle(ctx context.Context, value quota.Settlement) error {
+	s.settlements.Add(1)
+	if err := ctx.Err(); err != nil {
+		s.canceled.Store(true)
+		return err
+	}
+	return s.Store.Settle(ctx, value)
+}
+
+func TestCancellationDoesNotCancelSettlement(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	contract := policy.Default()
+	contract.Quota.StreamReserveTokens = 64
+	upstream := newUpstream(t, "primary", func(w http.ResponseWriter, _ *http.Request) {
+		cancel()
+		w.WriteHeader(http.StatusOK)
+	})
+	g := newTestGateway(t, contract, upstream)
+	memory := quota.NewMemoryStore()
+	store := &cancellationCheckingStore{Store: memory}
+	enableQuota(t, g, store, nil, "primary")
+	setTenantQuota(g, 0, 0, 10000)
+	g.providerList[0].budgetMicros = 10000
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody("fast", false))).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer "+testKey)
+	g.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	if store.canceled.Load() || store.settlements.Load() != 2 {
+		t.Fatalf("canceled/settlements = %v/%d", store.canceled.Load(), store.settlements.Load())
+	}
+	if len(memory.PendingIDs()) != 0 {
+		t.Fatal("canceled request left unsettled reservations")
+	}
+}
+
 func TestUncertainFailureIsChargedOnce(t *testing.T) {
 	contract := policy.Default()
 	contract.Quota.StreamReserveTokens = 64

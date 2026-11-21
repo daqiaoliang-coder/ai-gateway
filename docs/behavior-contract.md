@@ -88,8 +88,8 @@
 执行方式：
 
 - 请求**前**预留（reserve），响应完成**后**核账（settle）。
-- 预留和核账以 `request_id` + 尝试序号作为幂等键，重试不会重复扣账。
-- 预留带 TTL（`reservation_ttl`，默认 10m，上限 24h），进程崩溃后由清扫器回收，避免额度泄漏。清扫器每 `sweep_interval`（默认 1m，上限 1h）运行一次，扫描本副本见过的窗口键。
+- 租户预留以 `request_id` 为幂等键；供应商预留和审计使用请求 ID、尝试序号及供应商组成的尝试 ID。同一预留重复核账不重复扣款，但显式重放不确定结果时，每次可能产生消费的尝试都需要核账。
+- 预留带 TTL（`reservation_ttl`，默认 10m，上限 24h），由清扫器回收过期占额。清扫器每 `sweep_interval`（默认 1m，上限 1h）运行一次，从 Redis 全局 pending 索引中每次最多取 200 条，不依赖本副本见过哪些窗口；未完成预留的元数据保留至核账或释放。崩溃后已产生但未结算的费用仍需要持久账本与补偿机制，清扫本身不能完成对账。
 
 **窗口是固定分桶，不是滑动窗口。** 分桶边界处一个租户在相邻两个窗口内各花满一次是可能的（最坏 2 倍）。滑动窗口需要保留窗口内每一笔消费再做区间求和，在月度规模下不可行。若业务不能接受边界突发，应把预算窗口缩短并留出余量。
 
@@ -99,7 +99,7 @@
 - 每个窗口键有三个卫星键：`:u` 已核账、`:h` 在途预留、`:p` 未结算预留的 ZSET（score 为过期时间，用于崩溃回收）。
 - 金额一律用 `int64` 微单位（1e-6 货币单位）累计，避免浮点漂移。
 
-共享存储不可用时的降级（`quota.store.on_unavailable`）：
+共享存储不可用时，包含正金额预算的预留始终拒绝，返回 `503 quota_unavailable`；不能向每个副本重新发放预算。同一 ID 已确认的共享预留不改走本地，本地预留恢复后仍在本地结算。只有不含金额预算且尚未确定存储归属的请求使用以下降级策略（`quota.store.on_unavailable`）：
 
 | 策略 | 行为 | 适用 |
 | --- | --- | --- |
@@ -107,14 +107,14 @@
 | `fail_open` | 放行但标记为不可核账 | 可用性优先，接受超限 |
 | `degrade`（默认） | 本地桶按 `degrade_factor`（默认 0.5）降额运行 | 默认选择 |
 
-**计量要精确，执行可近似**：用量审计事件必须完整、持久；限额执行允许近实时（数十秒级滞后），不必把共享存储放进每次请求的关键路径。
+当前请求路径同步完成共享预留与核账，异步输出审计事件。生产级对账仍需要完整、持久的用量流水与结算补偿；不能将近似 token 预留或尽力审计视为严格的账务保证。
 
 ## 5. 流式请求的预算
 
 响应完成前 token 总量未知，因此：
 
 - 按 `quota.stream_reserve_tokens`（默认 4096）预留输入 token + 预估输出上限。
-- 超出预留时按 `quota.stream_overage` 处理：`abort`（默认，终止并记为 `truncated`）/ `allow`（允许超额，事后核账）/ `truncate`（向上游请求缩短输出）。
+- 目标是超出预留时按 `quota.stream_overage` 处理：`abort`（默认）/ `allow` / `truncate`。目前该策略尚未接入流式执行路径，预留不是严格 token 上界；实际用量超过预留时仍全额核账。
 - 网关必须为支持的供应商注入 `stream_options: {include_usage: true}`（`streaming.require_usage_in_stream = true`）。不这样做，流式请求的用量恒为 0，成本核算对流式直接失效。
 
 ## 6. 用量缺失与对账
@@ -122,12 +122,12 @@
 | 情况 | 处理 |
 | --- | --- |
 | 上游返回完整 usage | `reconciliation = ok` |
-| usage 字段缺失 | 按 `usage.missing_usage_policy`：`estimate`（默认，估算并标记）/ `reject` / `allow_zero` |
-| 流式中途中断 | `reconciliation = partial`，按已接收内容结算 |
-| 供应商返回异常值（负数、超出合理范围） | `reconciliation = missing`，记告警事件 |
+| usage 字段缺失 | `estimate` 使用请求及输出预留估算并标记；`reject` 保留估算费用、标记 `missing` 并告警，不能撤销已经发生的生成；`allow_zero` 显式零计费并标记 `missing` |
+| 流式中途中断 | 有 usage 时标记 `partial`；无 usage 时按缺失策略处理，另以流完成状态标明中断 |
+| 供应商返回缺项或负 token 数 | 视为用量缺失，不允许负数冲减额度 |
 
 - 价格信息版本化，记录计价单位、币种和生效版本（`usage.price_version_required = true`）。
-- 审计事件必须落到可查询的持久存储（`usage.audit_sink = both`），仅 stdout 不足以做成本对账。
+- 生产目标是将审计事件落到可查询、可重放的持久存储。当前 stdout / 追加文件均为尽力异步输出，配置 `both` 不等于可靠账本，尚不能保证崩溃后重建账务。
 
 ## 7. 流式中断语义
 
@@ -153,7 +153,7 @@ SSE 响应的完成状态 `StreamCompletion`：
 
 所有客户端可见错误使用统一信封 `{error:{message,type,code}}`，`code` 取自封闭集合：
 
-`unauthorized` · `model_not_allowed` · `model_not_found` · `invalid_request` · `request_too_large` · `rate_limit_exceeded` · `budget_exceeded` · `gateway_overloaded` · `upstream_unavailable` · `upstream_rate_limited` · `upstream_timeout` · `upstream_error` · `stream_aborted` · `draining` · `not_found` · `internal_error`
+`unauthorized` · `model_not_allowed` · `model_not_found` · `invalid_request` · `request_too_large` · `rate_limit_exceeded` · `token_rate_limit_exceeded` · `budget_exceeded` · `quota_unavailable` · `gateway_overloaded` · `upstream_unavailable` · `upstream_rate_limited` · `upstream_timeout` · `upstream_error` · `stream_aborted` · `draining` · `not_found` · `internal_error`
 
 - 上游错误默认归一为上述码；`error_codes.passthrough_statuses` 白名单内的状态码才透传原始响应体。
 - 结果分类到错误码的映射：`throttled → upstream_rate_limited`，`rejected → upstream_error`，`unknown → upstream_unavailable`，`partial → stream_aborted`。
@@ -190,8 +190,9 @@ SSE 响应的完成状态 `StreamCompletion`：
 | 4 | 部署 | `replicas: 1`、`image: latest`，无 PDB / NetworkPolicy / Redis 实例 | 4 |
 | 5 | `metrics.go` | 无直方图桶、无标签，无法按租户/模型/供应商切分 | 4 |
 | 6 | CI | 无预发环境故障场景验证；Redis 集成测试需显式开启 | 4 |
+| 7 | 配额 | 进程内共享预留归属需覆盖 Redis 的 24h 去重窗口，内存与清理成本随请求量增长，扩容前需压测；仍无跨进程结算补偿 | 4 |
 
-补充：跨供应商回退目前只按 `models[].deployments` 的声明顺序尝试，兼容组尚未进入配置文件；`fallback.require_compatibility_group` 已生效于契约层，配置结构在后续阶段落地。平台级供应商预算是**事后核账**（请求前不知道哪个供应商会应答），超额在下一请求被拒绝并记录事件。
+补充：跨供应商回退目前只按 `models[].deployments` 的声明顺序尝试，兼容组尚未进入配置文件；`fallback.require_compatibility_group` 已生效于契约层，配置结构在后续阶段落地。平台级供应商预算在每次上游尝试前预留，额度不足的部署不被调用；完成后按该次尝试的实际或估算用量核账。租户预留采用候选部署中的最高估算费用，显式启用不确定结果重试时覆盖最大尝试次数；最终合计每次可能产生消费的尝试，不能只结算最后一次。
 
 补充：跨供应商回退目前只按 `models[].deployments` 的声明顺序尝试，兼容组尚未进入配置文件；`fallback.require_compatibility_group` 已生效于契约层，配置结构在阶段 2 落地。
 

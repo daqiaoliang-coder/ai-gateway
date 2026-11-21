@@ -120,6 +120,13 @@ func (s *MemoryStore) Abandon(_ context.Context, id string) error {
 	return nil
 }
 
+func (s *MemoryStore) HasReservation(_ context.Context, id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.reserved[id]
+	return exists, nil
+}
+
 // Close clears all state.
 func (s *MemoryStore) Close() error { return nil }
 

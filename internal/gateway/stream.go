@@ -30,11 +30,12 @@ const (
 
 // streamResult is the outcome of forwarding a streamed response.
 type streamResult struct {
-	input      int64
-	output     int64
-	completion policy.StreamCompletion
-	fail       copyFailure
-	err        error
+	input         int64
+	output        int64
+	completion    policy.StreamCompletion
+	fail          copyFailure
+	err           error
+	usageReported bool
 }
 
 // copyStream forwards an SSE response with hard limits on a single event and on
@@ -44,24 +45,25 @@ func (g *Gateway) copyStream(w http.ResponseWriter, ctx context.Context, body io
 	reader := bufio.NewReaderSize(body, 8192)
 	var input, output, total int64
 	sawDone := false
+	usageReported := false
 
 	for {
 		line, readErr := readEventLine(reader, g.streamMaxEvent)
 		if len(line) > 0 {
 			total += int64(len(line))
 			if total > g.streamMaxBytes {
-				return streamResult{input, output, policy.StreamTruncated, failUpstream, errStreamTooLarge}
+				return streamResult{input, output, policy.StreamTruncated, failUpstream, errStreamTooLarge, usageReported}
 			}
 			switch data := eventData(line); {
 			case data == "[DONE]":
 				sawDone = true
 			case data != "":
-				if in, out := extractUsage([]byte(data)); in > 0 || out > 0 {
-					input, output = in, out
+				if in, out, reported := extractUsage([]byte(data)); reported {
+					input, output, usageReported = in, out, true
 				}
 			}
 			if _, writeErr := w.Write(line); writeErr != nil {
-				return streamResult{input, output, policy.StreamAbortedClient, failClient, writeErr}
+				return streamResult{input, output, policy.StreamAbortedClient, failClient, writeErr, usageReported}
 			}
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -72,22 +74,22 @@ func (g *Gateway) copyStream(w http.ResponseWriter, ctx context.Context, body io
 		}
 		if errors.Is(readErr, io.EOF) {
 			if sawDone {
-				return streamResult{input, output, policy.StreamCompleted, failNone, nil}
+				return streamResult{input, output, policy.StreamCompleted, failNone, nil, usageReported}
 			}
 			// A stream that never reached its terminal event is incomplete and
 			// must not be counted as a successful request.
-			return streamResult{input, output, policy.StreamAbortedUpstream, failUpstream, errNoTerminalEvent}
+			return streamResult{input, output, policy.StreamAbortedUpstream, failUpstream, errNoTerminalEvent, usageReported}
 		}
 		if errors.Is(readErr, errEventTooLarge) {
-			return streamResult{input, output, policy.StreamTruncated, failUpstream, readErr}
+			return streamResult{input, output, policy.StreamTruncated, failUpstream, readErr, usageReported}
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			if errors.Is(ctxErr, context.DeadlineExceeded) {
-				return streamResult{input, output, policy.StreamAbortedGateway, failGateway, ctxErr}
+				return streamResult{input, output, policy.StreamAbortedGateway, failGateway, ctxErr, usageReported}
 			}
-			return streamResult{input, output, policy.StreamAbortedClient, failClient, ctxErr}
+			return streamResult{input, output, policy.StreamAbortedClient, failClient, ctxErr, usageReported}
 		}
-		return streamResult{input, output, policy.StreamAbortedUpstream, failUpstream, readErr}
+		return streamResult{input, output, policy.StreamAbortedUpstream, failUpstream, readErr, usageReported}
 	}
 }
 

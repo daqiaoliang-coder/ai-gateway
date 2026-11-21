@@ -31,10 +31,8 @@ spec:
             - "/app/configs/policy.json"
           lifecycle:
             preStop:
-              exec:
-                # Gives kubelet time to remove this pod from the Service
-                # endpoints before the gateway starts refusing traffic.
-                command: ["/bin/sh", "-c", "sleep 5"]
+              sleep:
+                seconds: 5
           ports:
             - name: http
               containerPort: 8080

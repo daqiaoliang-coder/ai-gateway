@@ -19,8 +19,9 @@ import (
 //
 //	<key>:u  consumed amount, incremented at settle time
 //	<key>:h  amount held by unsettled attempts
-//	<key>:p  sorted set of unsettled attempt ids scored by expiry, which is what
-//	         lets a crashed replica's holds be reclaimed
+//	<key>:p  sorted set of unsettled attempt ids scored by expiry
+//
+// A global pending index enables cold-start sweeping; these scripts require standalone Redis.
 const (
 	scriptReserve = `
 local resKey = KEYS[1]
@@ -48,15 +49,14 @@ while i <= table.getn(m.lines) do
   if l.limit > 0 then
     redis.call('INCRBY', l.h, l.reserve)
     redis.call('ZADD', l.p, m.now_ms + m.ttl_ms, m.id)
-    if l.ttl > 0 then
-      redis.call('PEXPIRE', l.h, l.ttl)
-      redis.call('PEXPIRE', l.p, l.ttl)
-    end
+    redis.call('PERSIST', l.h)
+    redis.call('PERSIST', l.p)
   end
   i = i + 1
 end
 redis.call('HSET', resKey, 'st', 'held', 'm', raw)
-redis.call('PEXPIRE', resKey, m.ttl_ms * 8)
+redis.call('PERSIST', resKey)
+redis.call('ZADD', KEYS[2], m.now_ms + m.ttl_ms, m.id)
 return cjson.encode({allowed = true})
 `
 
@@ -76,9 +76,13 @@ while i <= table.getn(m.lines) do
     redis.call('DECRBY', l.h, l.reserve)
     if actual > 0 then redis.call('INCRBY', l.u, actual) end
     redis.call('ZREM', l.p, m.id)
+    if redis.call('ZCARD', l.p) == 0 and l.ttl > 0 then
+      redis.call('PEXPIRE', l.h, l.ttl)
+    end
   end
   i = i + 1
 end
+redis.call('ZREM', KEYS[2], m.id)
 redis.call('HSET', resKey, 'st', 'settled', 'a', ARGV[1])
 redis.call('PEXPIRE', resKey, 86400000)
 return cjson.encode({ok = true})
@@ -96,44 +100,46 @@ while i <= table.getn(m.lines) do
   if l.limit > 0 then
     redis.call('DECRBY', l.h, l.reserve)
     redis.call('ZREM', l.p, m.id)
+    if redis.call('ZCARD', l.p) == 0 and l.ttl > 0 then
+      redis.call('PEXPIRE', l.h, l.ttl)
+    end
   end
   i = i + 1
 end
+redis.call('ZREM', KEYS[2], m.id)
 redis.call('DEL', resKey)
 return cjson.encode({ok = true})
 `
 
 	scriptSweep = `
 local a = cjson.decode(ARGV[1])
+local pendKey = KEYS[1]
+local expired = redis.call('ZRANGEBYSCORE', pendKey, '-inf', a.now_ms, 'LIMIT', 0, 200)
 local released = 0
 local i = 1
-while i <= table.getn(KEYS) do
-  local pendKey = KEYS[i]
-  local expired = redis.call('ZRANGEBYSCORE', pendKey, '-inf', a.now_ms, 'LIMIT', 0, 200)
-  local j = 1
-  while j <= table.getn(expired) do
-    local id = expired[j]
-    local rk = a.prefix .. id
-    local st = redis.call('HGET', rk, 'st')
-    local raw = redis.call('HGET', rk, 'm')
-    if st == 'held' and raw then
-      local m = cjson.decode(raw)
-      local k = 1
-      while k <= table.getn(m.lines) do
-        local l = m.lines[k]
-        if l.limit > 0 then
-          redis.call('DECRBY', l.h, l.reserve)
-          redis.call('ZREM', l.p, m.id)
+while i <= table.getn(expired) do
+  local id = expired[i]
+  local rk = a.prefix .. id
+  local st = redis.call('HGET', rk, 'st')
+  local raw = redis.call('HGET', rk, 'm')
+  if st == 'held' and raw then
+    local m = cjson.decode(raw)
+    local j = 1
+    while j <= table.getn(m.lines) do
+      local l = m.lines[j]
+      if l.limit > 0 then
+        redis.call('DECRBY', l.h, l.reserve)
+        redis.call('ZREM', l.p, m.id)
+        if redis.call('ZCARD', l.p) == 0 and l.ttl > 0 then
+          redis.call('PEXPIRE', l.h, l.ttl)
         end
-        k = k + 1
       end
-      redis.call('DEL', rk)
-      released = released + 1
-    else
-      redis.call('ZREM', pendKey, id)
+      j = j + 1
     end
-    j = j + 1
+    redis.call('DEL', rk)
+    released = released + 1
   end
+  redis.call('ZREM', pendKey, id)
   i = i + 1
 end
 return released
@@ -171,7 +177,7 @@ type RedisConfig struct {
 type RedisStore struct {
 	pool   *redisPool
 	prefix string
-	// counterTTL bounds how long a window key survives once empty.
+	// Active holds must survive until finalization, regardless of this cleanup TTL.
 	counterTTL time.Duration
 }
 
@@ -210,6 +216,7 @@ func (s *RedisStore) counterKeys(line Line) (used, held, pend string) {
 }
 
 func (s *RedisStore) resKey(id string) string { return s.prefix + "res:" + id }
+func (s *RedisStore) pendingKey() string      { return s.prefix + "pending" }
 
 // Reserve grants every line atomically, or refuses without consuming anything.
 func (s *RedisStore) Reserve(ctx context.Context, plan Plan) (Decision, error) {
@@ -238,7 +245,7 @@ func (s *RedisStore) Reserve(ctx context.Context, plan Plan) (Decision, error) {
 	if err != nil {
 		return Decision{}, err
 	}
-	reply, err := s.pool.evalScript(scriptReserve, 1, []string{s.resKey(plan.ID)}, []string{string(raw)})
+	reply, err := s.pool.evalScript(scriptReserve, 2, []string{s.resKey(plan.ID), s.pendingKey()}, []string{string(raw)})
 	if err != nil {
 		return Decision{}, classifyRedisError(err)
 	}
@@ -257,11 +264,20 @@ func (s *RedisStore) Reserve(ctx context.Context, plan Plan) (Decision, error) {
 	if result.Allowed {
 		return Decision{Allowed: true, Duplicate: result.Duplicate, Reason: "granted"}, nil
 	}
+	var deniedKind Kind
+	for _, line := range plan.Lines {
+		used, _, _ := s.counterKeys(line)
+		if used == result.DeniedKey {
+			deniedKind = line.Kind
+			break
+		}
+	}
 	return Decision{
-		Allowed:   false,
-		DeniedKey: result.DeniedKey,
-		Remaining: result.Remaining,
-		Reason:    "limit_exhausted",
+		Allowed:    false,
+		DeniedKey:  result.DeniedKey,
+		DeniedKind: deniedKind,
+		Remaining:  result.Remaining,
+		Reason:     "limit_exhausted",
 	}, nil
 }
 
@@ -271,7 +287,7 @@ func (s *RedisStore) Settle(ctx context.Context, settlement Settlement) error {
 	if err != nil {
 		return err
 	}
-	reply, err := s.pool.evalScript(scriptSettle, 1, []string{s.resKey(settlement.ID)}, []string{string(payload)})
+	reply, err := s.pool.evalScript(scriptSettle, 2, []string{s.resKey(settlement.ID), s.pendingKey()}, []string{string(payload)})
 	if err != nil {
 		return classifyRedisError(err)
 	}
@@ -280,28 +296,20 @@ func (s *RedisStore) Settle(ctx context.Context, settlement Settlement) error {
 
 // Abandon returns held amounts untouched.
 func (s *RedisStore) Abandon(ctx context.Context, id string) error {
-	reply, err := s.pool.evalScript(scriptAbandon, 1, []string{s.resKey(id)}, nil)
+	reply, err := s.pool.evalScript(scriptAbandon, 2, []string{s.resKey(id), s.pendingKey()}, nil)
 	if err != nil {
 		return classifyRedisError(err)
 	}
 	return resultError(reply)
 }
 
-// Sweep reclaims holds whose TTL expired. It is how a replica that crashed
-// between reserve and settle stops leaking budget.
-func (s *RedisStore) Sweep(ctx context.Context, pendKeys []string, now time.Time) (int, error) {
-	if len(pendKeys) == 0 {
-		return 0, nil
-	}
+// The shared index enables cold-start recovery without unbounded keyspace scans.
+func (s *RedisStore) Sweep(ctx context.Context, _ []string, now time.Time) (int, error) {
 	payload, err := json.Marshal(map[string]any{"now_ms": now.UnixMilli(), "prefix": s.prefix + "res:"})
 	if err != nil {
 		return 0, err
 	}
-	keys := make([]string, 0, len(pendKeys))
-	for _, key := range pendKeys {
-		keys = append(keys, s.prefix+key+":p")
-	}
-	reply, err := s.pool.evalScript(scriptSweep, len(keys), keys, []string{string(payload)})
+	reply, err := s.pool.evalScript(scriptSweep, 1, []string{s.pendingKey()}, []string{string(payload)})
 	if err != nil {
 		return 0, classifyRedisError(err)
 	}
@@ -334,6 +342,20 @@ func (s *RedisStore) Counters(lineKey string) (used, held int64, err error) {
 		held, _ = strconv.ParseInt(heldReply.Text(), 10, 64)
 	}
 	return used, held, nil
+}
+
+func (s *RedisStore) HasReservation(ctx context.Context, id string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	reply, err := s.pool.run([]string{"EXISTS", s.resKey(id)})
+	if err != nil {
+		return false, classifyRedisError(err)
+	}
+	if reply.typ != ':' {
+		return false, fmt.Errorf("unexpected reservation lookup response")
+	}
+	return reply.Int() != 0, nil
 }
 
 // Close releases the connection pool.
