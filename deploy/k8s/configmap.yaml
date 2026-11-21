@@ -57,7 +57,7 @@ data:
         "stream_reserve_tokens": 4096,
         "stream_overage": "abort"
       },
-      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "both", "audit_file_path": "/var/log/ai-gateway/audit.jsonl"},
+      "usage": {"missing_usage_policy": "estimate", "price_version_required": true, "emit_audit_events": true, "audit_sink": "stdout"},
       "streaming": {"max_event_bytes": 262144, "max_stream_bytes": 16777216, "require_usage_in_stream": true, "abort_on_client_gone": true},
       "drain": {"timeout": "30s", "readiness_fails_on_drain": true, "liveness_depends_on_upstream": false},
       "observability": {"max_label_cardinality": 200, "allowed_labels": ["tenant", "client", "model", "provider", "route", "status_class", "outcome", "error_code"]},
